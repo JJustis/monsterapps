@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-MonsterApps Enhanced Client - Complete Fixed Version with ModLoader and In-Process Modding API
+MonsterApps Enhanced Client - Direct Mod Access Version
 A distributed app store with mesh networking, PFS encryption, and MySQL node discovery.
-Fixed version with proper error handling, simplified database operations, and thread safety.
-Now includes a ModLoader that loads Python mods directly into the client process
-and provides a restricted API for mods to interact with the GUI and client data,
-while strictly preventing direct mod access to network functions.
+Mods now have DIRECT access to modify the client GUI and functionality.
+Applications are separate launchable programs like Skype.
+WARNING: Mods can break the client - this is by design for maximum flexibility.
 """
 
 import os
@@ -31,36 +30,23 @@ from typing import Dict, List, Optional, Set, Any, Tuple
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import subprocess
-import importlib.util # For dynamic module loading
+import importlib.util
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-# --- Security Guardrail: Prevent direct network imports in mods if possible ---
-# This is a best-effort attempt. A determined malicious mod could still try to bypass.
-# For a truly secure system, a separate process with strict IPC is recommended.
-_original_import = __builtins__.__import__
-
-def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
-    if name in ['requests', 'socket', 'urllib.request', 'http.client', 'webbrowser', 'mysql.connector']:
-        raise ImportError(f"Direct import of '{name}' is restricted for mods for security reasons.")
-    return _original_import(name, globals, locals, fromlist, level)
-
-# We will apply this restriction when loading mods.
-# For the main client, we still need these imports.
-
-# Setup comprehensive logging to catch silent errors
+# Setup comprehensive logging with Unicode support
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s',\
+    format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s',
     handlers=[
-        logging.FileHandler('monsterapps.log'),
+        logging.FileHandler('monsterapps.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Optional imports with fallbacks (for the main client)
+# Optional imports with fallbacks
 try:
     import requests
     try:
@@ -109,7 +95,7 @@ CONFIG = {
     'UPLOAD_PATH': 'meshnetwork/monsterapps/apps',
     'MAX_PEERS': 10,
     'APPS_DIR': 'installed_apps',
-    'EXPANSIONS_DIR': 'expansions', # This directory will now also house mods
+    'MODS_DIR': 'mods',
     'BACKUPS_DIR': 'client_backups',
     'ENABLE_DATABASE': True,
     'ENABLE_PORTAL': True
@@ -126,7 +112,6 @@ def safe_thread_wrapper(func):
             return func(*args, **kwargs)
         except Exception as e:
             logger.error(f"Thread error in {func.__name__}: {e}", exc_info=True)
-            # Don't re-raise - just log to prevent silent crashes
     return wrapper
 
 # ===========================
@@ -135,7 +120,7 @@ def safe_thread_wrapper(func):
 
 @dataclass
 class AppInfo:
-    """Enhanced application information model, now also used for mods (expansions)"""
+    """Application information model - distinguishes between apps and mods"""
     app_id: str
     name: str
     version: str
@@ -151,7 +136,7 @@ class AppInfo:
     rating: float = 0.0
     created_at: float = 0.0
     uploaded: bool = False
-    is_expansion: bool = False # This flag is key for mods
+    is_mod: bool = False  # True for mods, False for applications
     usage_time: float = 0.0
     last_used: float = 0.0
     launch_count: int = 0
@@ -176,8 +161,9 @@ class AppInfo:
             data['company'] = "Unknown"
         if 'app_token' not in data:
             data['app_token'] = secrets.token_hex(16)
-        if 'is_expansion' not in data:
-            data['is_expansion'] = False
+        if 'is_mod' not in data:
+            # Handle legacy 'is_expansion' field
+            data['is_mod'] = data.get('is_expansion', False)
         if 'usage_time' not in data:
             data['usage_time'] = 0.0
         if 'last_used' not in data:
@@ -191,7 +177,7 @@ class AppInfo:
 
 @dataclass
 class NodeInfo:
-    """Enhanced node information with chat support"""
+    """Node information with chat support"""
     node_id: str
     username: str
     ip_address: str
@@ -228,7 +214,6 @@ class SimpleDatabase:
             logger.warning("Database disabled - using fallback mode")
             self.fallback_mode = True
         
-        # Fallback storage
         self.fallback_data = {
             'nodes': {},
             'messages': [],
@@ -238,7 +223,6 @@ class SimpleDatabase:
     def _init_connection_pool(self):
         """Initialize MySQL connection pool"""
         try:
-            # First ensure database exists
             temp_config = {
                 'host': CONFIG['MYSQL_HOST'],
                 'user': CONFIG['MYSQL_USER'],
@@ -253,7 +237,6 @@ class SimpleDatabase:
             cursor.close()
             temp_conn.close()
             
-            # Create connection pool
             pool_config = {
                 'host': CONFIG['MYSQL_HOST'],
                 'user': CONFIG['MYSQL_USER'],
@@ -267,10 +250,7 @@ class SimpleDatabase:
             }
             
             self.pool = MySQLConnectionPool(**pool_config)
-            
-            # Initialize tables
             self._init_tables()
-            
             logger.info("Database connection pool initialized")
             
         except Exception as e:
@@ -322,10 +302,12 @@ class SimpleDatabase:
                 file_size BIGINT NOT NULL,
                 file_hash VARCHAR(64) NOT NULL,
                 download_url VARCHAR(500),
+                is_mod BOOLEAN DEFAULT FALSE,
                 last_verified TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 status ENUM('available', 'unavailable', 'verifying') DEFAULT 'available',
                 UNIQUE KEY unique_node_app (node_id, app_token),
-                INDEX idx_node_id (node_id)
+                INDEX idx_node_id (node_id),
+                INDEX idx_is_mod (is_mod)
             )
             """
         ]
@@ -350,8 +332,7 @@ class SimpleDatabase:
                 else:
                     cursor.execute(query)
                 
-                # Connection pool handles commit with autocommit=True
-                self.error_count = 0  # Reset on success
+                self.error_count = 0
                 return True
                 
             except Exception as e:
@@ -362,7 +343,7 @@ class SimpleDatabase:
                 if cursor:
                     cursor.close()
                 if connection:
-                    connection.close()  # Returns to pool
+                    connection.close()
     
     def query(self, query: str, params: tuple = None, fetch_one: bool = False) -> Optional[Any]:
         """Execute a SELECT query - returns results"""
@@ -386,7 +367,7 @@ class SimpleDatabase:
                 else:
                     result = cursor.fetchall()
                 
-                self.error_count = 0  # Reset on success
+                self.error_count = 0
                 return result
                 
             except Exception as e:
@@ -397,7 +378,7 @@ class SimpleDatabase:
                 if cursor:
                     cursor.close()
                 if connection:
-                    connection.close()  # Returns to pool
+                    connection.close()
     
     def _handle_error(self, error_msg: str):
         """Handle database errors with fallback"""
@@ -412,13 +393,12 @@ class SimpleDatabase:
     def _execute_fallback(self, query: str, params: tuple = None) -> bool:
         """Fallback execute for when database is unavailable"""
         logger.debug(f"Fallback execute: {query[:50]}...")
-        return True  # Always succeed in fallback
+        return True
     
     def _query_fallback(self, query: str, params: tuple = None, fetch_one: bool = False) -> Optional[Any]:
         """Fallback query for when database is unavailable"""
         logger.debug(f"Fallback query: {query[:50]}...")
         
-        # Simple fallback for common queries
         if "mesh_nodes" in query.lower():
             nodes = list(self.fallback_data['nodes'].values())
             return nodes[0] if fetch_one and nodes else nodes
@@ -436,7 +416,6 @@ class SimpleDatabase:
     def close(self):
         """Close database connections"""
         if self.pool:
-            # Connection pools don't need explicit closing in mysql-connector-python
             pass
 
 # ===========================
@@ -484,7 +463,6 @@ class AppDownloadHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Missing app token")
             return
         
-        # Find app by token
         target_app = None
         for app in self.app_manager.get_apps():
             if app.app_token == app_token:
@@ -499,26 +477,25 @@ class AppDownloadHandler(BaseHTTPRequestHandler):
             self.send_error(404, "App file not found on server")
             return
         
-        # Send file
         try:
             with open(target_app.file_path, 'rb') as f:
                 content = f.read()
             
             self.send_response(200)
             self.send_header('Content-Type', 'application/octet-stream')
-            self.send_header('Content-Disposition', f'attachment; filename="{target_app.name}.exe"')
+            self.send_header('Content-Disposition', f'attachment; filename="{target_app.name}.{"py" if target_app.is_mod else "exe"}"')
             self.send_header('Content-Length', str(len(content)))
             self.send_header('X-App-Hash', target_app.file_hash)
             self.send_header('X-App-Token', target_app.app_token)
+            self.send_header('X-Is-Mod', str(target_app.is_mod))
             self.end_headers()
             
             self.wfile.write(content)
             
-            # Update download count
             target_app.downloads += 1
             self.app_manager.save_apps()
             
-            logger.info(f"App downloaded: {target_app.name} (token: {app_token})")
+            logger.info(f"{'Mod' if target_app.is_mod else 'App'} downloaded: {target_app.name} (token: {app_token})")
             
         except Exception as e:
             self.send_error(500, f"Download failed: {e}")
@@ -531,7 +508,6 @@ class AppDownloadHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Missing app token")
             return
         
-        # Find app and calculate current hash
         target_app = None
         for app in self.app_manager.get_apps():
             if app.app_token == app_token:
@@ -546,7 +522,6 @@ class AppDownloadHandler(BaseHTTPRequestHandler):
             self.send_error(404, "App file not found on disk")
             return
         
-        # Calculate current file hash
         try:
             current_hash = self._calculate_md5_hash(target_app.file_path)
             
@@ -558,6 +533,7 @@ class AppDownloadHandler(BaseHTTPRequestHandler):
                 'file_size': os.path.getsize(target_app.file_path),
                 'app_name': target_app.name,
                 'file_exists': True,
+                'is_mod': target_app.is_mod,
                 'debug_info': {
                     'stored_hash_length': len(target_app.file_hash),
                     'current_hash_length': len(current_hash),
@@ -594,7 +570,8 @@ class AppDownloadHandler(BaseHTTPRequestHandler):
         status_data = {
             'status': 'online',
             'timestamp': time.time(),
-            'apps_available': len(self.app_manager.get_apps()),
+            'apps_available': len([app for app in self.app_manager.get_apps() if not app.is_mod]),
+            'mods_available': len([app for app in self.app_manager.get_apps() if app.is_mod]),
             'node_id': self.auth_system.node_id if self.auth_system else 'unknown'
         }
         
@@ -618,7 +595,7 @@ class AppDownloadHandler(BaseHTTPRequestHandler):
                 'file_size': app.file_size,
                 'downloads': app.downloads,
                 'rating': app.rating,
-                'is_expansion': app.is_expansion
+                'is_mod': app.is_mod
             })
         
         self.send_response(200)
@@ -643,11 +620,13 @@ class AppDownloadHandler(BaseHTTPRequestHandler):
                     'file_path': app.file_path,
                     'file_exists': file_exists,
                     'current_size': current_size,
-                    'size_match': current_size == app.file_size if file_exists else False
+                    'size_match': current_size == app.file_size if file_exists else False,
+                    'is_mod': app.is_mod
                 })
             
             debug_data = {
-                'total_apps': len(self.app_manager.get_apps()),
+                'total_apps': len([app for app in self.app_manager.get_apps() if not app.is_mod]),
+                'total_mods': len([app for app in self.app_manager.get_apps() if app.is_mod]),
                 'web_server_port': CONFIG['WEBSERVER_PORT'],
                 'apps': apps_info,
                 'server_status': 'running'
@@ -682,14 +661,13 @@ class AppDownloadHandler(BaseHTTPRequestHandler):
                 else:
                     errors.append(f"{app.name}: File not found")
             
-            # Save updated hashes
             if updated_count > 0:
                 self.app_manager.save_apps()
             
             response_data = {
                 'success': True,
                 'updated_count': updated_count,
-                'total_apps': len(self.app_manager.get_apps()),
+                'total_items': len(self.app_manager.get_apps()),
                 'errors': errors
             }
             
@@ -698,13 +676,13 @@ class AppDownloadHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(response_data, indent=2).encode())
             
-            logger.info(f"Hash refresh completed: {updated_count} apps updated")
+            logger.info(f"Hash refresh completed: {updated_count} items updated")
             
         except Exception as e:
             self.send_error(500, f"Hash refresh failed: {e}")
     
     def _calculate_md5_hash(self, file_path: str) -> str:
-        """Calculate MD5 hash of file (consistent method)"""
+        """Calculate MD5 hash of file"""
         hash_md5 = hashlib.md5()
         try:
             with open(file_path, "rb") as f:
@@ -781,7 +759,6 @@ class CPU8BitEmulator:
         bytecode = []
         labels = {}
         
-        # First pass - find labels
         pc = 0
         for line in lines:
             line = line.strip()
@@ -792,7 +769,6 @@ class CPU8BitEmulator:
             else:
                 pc += 1
         
-        # Second pass - generate bytecode
         for line in lines:
             line = line.strip()
             if not line or line.startswith(';') or line.endswith(':'):
@@ -804,7 +780,6 @@ class CPU8BitEmulator:
                 'args': parts[1:] if len(parts) > 1 else []
             }
             
-            # Replace labels with addresses
             for i, arg in enumerate(instruction['args']):
                 if arg in labels:
                     instruction['args'][i] = str(labels[arg])
@@ -959,7 +934,7 @@ class CPU8BitEmulator:
 # ===========================
 
 class EnhancedAppManager:
-    """Enhanced app manager with expansion support and usage tracking"""
+    """Enhanced app manager with mod support and usage tracking"""
     
     def __init__(self, data_dir: str = "monsterapps_data"):
         self.data_dir = Path(data_dir)
@@ -968,11 +943,10 @@ class EnhancedAppManager:
         self.usage_db = self.data_dir / "usage.db"
         self.upload_dir = self.data_dir / CONFIG['UPLOAD_PATH']
         self.apps_dir = self.data_dir / CONFIG['APPS_DIR']
-        self.expansions_dir = self.data_dir / CONFIG['EXPANSIONS_DIR']
+        self.mods_dir = self.data_dir / CONFIG['MODS_DIR']
         self.backups_dir = self.data_dir / CONFIG['BACKUPS_DIR']
         
-        # Create directories
-        for directory in [self.upload_dir, self.apps_dir, self.expansions_dir, self.backups_dir]:
+        for directory in [self.upload_dir, self.apps_dir, self.mods_dir, self.backups_dir]:
             directory.mkdir(parents=True, exist_ok=True)
         
         self.apps: Dict[str, AppInfo] = {}
@@ -1033,7 +1007,7 @@ class EnhancedAppManager:
                         logger.error(f"Error loading app {app_id}: {e}")
                         continue
                         
-                logger.info(f"Loaded {len(self.apps)} apps successfully")
+                logger.info(f"Loaded {len(self.apps)} items successfully")
                         
             except Exception as e:
                 logger.error(f"Error loading apps registry: {e}")
@@ -1049,7 +1023,7 @@ class EnhancedAppManager:
         if not self.apps:
             return
         
-        logger.info("Validating app file hashes...")
+        logger.info("Validating file hashes...")
         updated_count = 0
         
         for app_id, app in self.apps.items():
@@ -1071,10 +1045,10 @@ class EnhancedAppManager:
                 logger.error(f"Error validating {app.name}: {e}")
         
         if updated_count > 0:
-            logger.info(f"Updated {updated_count} app hashes")
+            logger.info(f"Updated {updated_count} hashes")
             self.save_apps()
         else:
-            logger.info("All app hashes are up to date")
+            logger.info("All hashes are up to date")
     
     def save_apps(self):
         """Save apps to registry file"""
@@ -1085,8 +1059,8 @@ class EnhancedAppManager:
             logger.error(f"Error saving apps: {e}")
     
     def add_app(self, file_path: str, name: str = None, category: str = "Utilities", 
-                company: str = "Unknown", is_expansion: bool = False) -> Optional[AppInfo]:
-        """Add new app with enhanced metadata. Returns the added AppInfo object."""
+                company: str = "Unknown", is_mod: bool = False) -> Optional[AppInfo]:
+        """Add new app or mod"""
         try:
             if not os.path.exists(file_path):
                 logger.error(f"File not found: {file_path}")
@@ -1096,13 +1070,11 @@ class EnhancedAppManager:
             file_hash = self._calculate_hash(file_path)
             app_token = secrets.token_hex(16)
             
-            # Generate a unique app_id. If a file with this path already exists,
-            # we might want to update it or return the existing one.
-            # For simplicity, let's check if an app with this file_path already exists.
+            # Check if already exists
             for existing_app in self.apps.values():
-                if existing_app.file_path == file_path and existing_app.is_expansion == is_expansion:
-                    logger.info(f"App/Mod '{name}' from {file_path} already registered. Skipping.")
-                    return existing_app # Return existing app if found
+                if existing_app.file_path == file_path and existing_app.is_mod == is_mod:
+                    logger.info(f"Item '{name}' from {file_path} already registered.")
+                    return existing_app
             
             app = AppInfo(
                 app_id=str(uuid.uuid4()),
@@ -1116,73 +1088,66 @@ class EnhancedAppManager:
                 file_size=file_size,
                 file_hash=file_hash,
                 app_token=app_token,
-                is_expansion=is_expansion
+                is_mod=is_mod
             )
             
             self.apps[app.app_id] = app
             self.save_apps()
             
-            target_dir = self.expansions_dir if is_expansion else self.apps_dir
+            target_dir = self.mods_dir if is_mod else self.apps_dir
             self._prepare_for_hosting(app, target_dir)
             
             self._init_app_usage(app.app_id)
             
-            logger.info(f"Added app: {app.name} (Is Expansion: {is_expansion})")
+            logger.info(f"Added {'mod' if is_mod else 'app'}: {app.name}")
             return app
             
         except Exception as e:
-            logger.error(f"Error adding app: {e}")
+            logger.error(f"Error adding {'mod' if is_mod else 'app'}: {e}")
             return None
     
     def _prepare_for_hosting(self, app: AppInfo, target_dir: Path):
-        """Prepare app for network hosting (copies to designated directory)"""
+        """Prepare app for network hosting"""
         try:
             file_ext = Path(app.file_path).suffix
-            # Ensure unique filename based on app_id, not token, to avoid issues if tokens change
-            hosted_filename = f"{app.app_id}{file_ext}" 
+            hosted_filename = f"{app.app_id}{file_ext}"
             hosted_path = target_dir / hosted_filename
             
-            # Only copy if source and destination are different
             if Path(app.file_path).resolve() != hosted_path.resolve():
                 shutil.copy2(app.file_path, hosted_path)
                 logger.info(f"Copied {app.name} to hosting path: {hosted_path}")
             else:
-                logger.info(f"App {app.name} already in hosting path: {hosted_path}")
+                logger.info(f"{app.name} already in hosting path: {hosted_path}")
 
-            app.file_path = str(hosted_path) # Update app's file_path to the hosted location
-            app.uploaded = True # This refers to being ready for local hosting, not necessarily portal upload
+            app.file_path = str(hosted_path)
+            app.uploaded = True
             self.save_apps()
             
         except Exception as e:
             logger.error(f"Hosting preparation failed for {app.name}: {e}")
-            # Revert file_path if copy failed to prevent broken links
-            # (though this is tricky if the original was already overwritten/moved)
-            # For now, just log and let subsequent checks handle missing files.
     
-    def launch_app(self, app_id: str, callback=None) -> bool:
-        """Launch app and track usage"""
+    def launch_app(self, app_id: str, callback=None, gui_instance=None) -> bool:
+        """Launch application or load mod"""
         if app_id not in self.apps:
-            logger.warning(f"Attempted to launch non-existent app with ID: {app_id}")
+            logger.warning(f"Attempted to launch non-existent item with ID: {app_id}")
             return False
         
         app = self.apps[app_id]
         
-        # Ensure the file actually exists before attempting to launch
         if not os.path.exists(app.file_path):
-            messagebox.showerror("Launch Error", f"App file not found: {app.file_path}")
-            logger.error(f"Cannot launch app '{app.name}': file not found at {app.file_path}")
+            messagebox.showerror("Launch Error", f"File not found: {app.file_path}")
+            logger.error(f"Cannot launch {app.name}: file not found at {app.file_path}")
             return False
 
-        if app.is_expansion:
-            # For expansions (mods), we now attempt in-process loading
-            return self._load_and_init_mod(app, callback)
+        if app.is_mod:
+            # Load mod directly into client process
+            return self._load_mod(app, gui_instance)
         
-        # For regular apps, continue with subprocess launch
+        # Launch application as separate process
         try:
             start_time = time.time()
             self._record_launch(app_id)
             
-            # Determine how to launch based on file extension
             if app.file_path.lower().endswith('.py'):
                 subprocess.Popen([sys.executable, app.file_path])
             elif app.file_path.lower().endswith(('.exe', '.bat', '.com')):
@@ -1198,12 +1163,64 @@ class EnhancedAppManager:
                 threading.Thread(target=self._track_usage_session, 
                                args=(app_id, start_time, callback), daemon=True).start()
             
-            logger.info(f"Launched app: {app.name}")
+            logger.info(f"Launched application: {app.name}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to launch app '{app.name}': {e}", exc_info=True)
+            logger.error(f"Failed to launch application '{app.name}': {e}", exc_info=True)
             messagebox.showerror("Launch Error", f"Failed to launch application '{app.name}': {e}")
+            return False
+    
+    def _load_mod(self, app: AppInfo, gui_instance) -> bool:
+        """Load mod directly into client process with FULL access"""
+        logger.info(f"Loading mod: {app.name} from {app.file_path}")
+        
+        # Optional backup creation (user can decline)
+        if messagebox.askyesno(
+            "Mod Loading",
+            f"'{app.name}' is a mod that will modify the client directly.\n\n"
+            "Would you like to create a backup first?\n"
+            "(Recommended but optional)"
+        ):
+            if not self._create_client_backup():
+                if not messagebox.askyesno("Backup Failed", "Backup creation failed. Continue loading mod anyway?"):
+                    return False
+
+        mod_name = Path(app.file_path).stem
+        try:
+            # Load the mod module with NO RESTRICTIONS
+            spec = importlib.util.spec_from_file_location(mod_name, app.file_path)
+            if spec is None or spec.loader is None:
+                messagebox.showerror("Mod Load Error", f"Could not load mod: {app.name}")
+                logger.error(f"Could not load mod spec for: {app.name}")
+                return False
+
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[mod_name] = module
+            
+            # Execute the module with FULL access to everything
+            spec.loader.exec_module(module)
+
+            # Call init_mod if it exists
+            if hasattr(module, 'init_mod') and callable(module.init_mod):
+                logger.info(f"Calling init_mod for {app.name}")
+                
+                # Create FULL access API
+                mod_api = DirectModAPI(gui_instance, self, logger)
+                module.init_mod(mod_api)
+                
+                messagebox.showinfo("Mod Loaded", f"Mod '{app.name}' loaded successfully with full access!")
+                self._record_launch(app.app_id)
+                return True
+            else:
+                # Even without init_mod, the module is loaded and can do anything
+                messagebox.showinfo("Mod Loaded", f"Mod '{app.name}' loaded (no init_mod function found)!")
+                self._record_launch(app.app_id)
+                return True
+
+        except Exception as e:
+            messagebox.showerror("Mod Load Error", f"Failed to load mod '{app.name}': {e}")
+            logger.error(f"Failed to load mod '{app.name}': {e}", exc_info=True)
             return False
     
     def _create_client_backup(self) -> bool:
@@ -1213,14 +1230,12 @@ class EnhancedAppManager:
             backup_name = f"client_backup_{timestamp}"
             backup_path = self.backups_dir / backup_name
             
-            # Get the current working directory of the main script
             current_script_dir = Path(sys.argv[0]).parent.resolve()
             
-            # Copy the entire client directory, ignoring common temporary files and backup dir itself
             shutil.copytree(current_script_dir, backup_path, 
                             ignore=shutil.ignore_patterns('*.pyc', '__pycache__', 
-                                                          self.data_dir.name, # Exclude the data directory itself
-                                                          self.backups_dir.name)) # Exclude backups directory
+                                                          self.data_dir.name,
+                                                          self.backups_dir.name))
             
             logger.info(f"Client backup created: {backup_path}")
             return True
@@ -1233,10 +1248,7 @@ class EnhancedAppManager:
     def _track_usage_session(self, app_id: str, start_time: float, callback):
         """Track app usage session"""
         import time
-        # This is a placeholder for actual process monitoring.
-        # In a real app, you'd monitor the subprocess or have the app report its status.
-        
-        time.sleep(5) # Simulate minimum 5 seconds of "usage"
+        time.sleep(5)
         end_time = time.time()
         duration = end_time - start_time
         
@@ -1267,7 +1279,7 @@ class EnhancedAppManager:
                 callback(app_id, duration)
                 
         except Exception as e:
-            logger.error(f"Usage tracking error for app {app_id}: {e}", exc_info=True)
+            logger.error(f"Usage tracking error for {app_id}: {e}", exc_info=True)
     
     def _record_launch(self, app_id: str):
         """Record app launch"""
@@ -1288,7 +1300,7 @@ class EnhancedAppManager:
                 self.apps[app_id].last_used = time.time()
                 
         except Exception as e:
-            logger.error(f"Launch recording error for app {app_id}: {e}", exc_info=True)
+            logger.error(f"Launch recording error for {app_id}: {e}", exc_info=True)
     
     def _init_app_usage(self, app_id: str):
         """Initialize usage tracking for new app"""
@@ -1304,7 +1316,7 @@ class EnhancedAppManager:
             conn.close()
             
         except Exception as e:
-            logger.error(f"Usage initialization error for app {app_id}: {e}", exc_info=True)
+            logger.error(f"Usage initialization error for {app_id}: {e}", exc_info=True)
     
     def _update_badges(self, app_id: str):
         """Update achievement badges for app"""
@@ -1322,8 +1334,10 @@ class EnhancedAppManager:
             badges.add("🏆 Power User")
         if app.downloads >= 100:
             badges.add("📈 Popular")
-        if app.is_expansion:
-            badges.add("🔧 Expansion/Mod") # Updated badge text
+        if app.is_mod:
+            badges.add("🔧 Mod")
+        else:
+            badges.add("📱 Application")
         
         app.badges = list(badges)
         self.save_apps()
@@ -1358,7 +1372,7 @@ class EnhancedAppManager:
             conn.close()
             
         except Exception as e:
-            logger.error(f"Stats retrieval error for app {app_id}: {e}", exc_info=True)
+            logger.error(f"Stats retrieval error for {app_id}: {e}", exc_info=True)
             total_time, launches, last_used, session_count = 0, 0, 0, 0
         
         return {
@@ -1375,12 +1389,12 @@ class EnhancedAppManager:
             'downloads': app.downloads,
             'rating': app.rating,
             'badges': app.badges,
-            'is_expansion': app.is_expansion,
+            'is_mod': app.is_mod,
             'created_at': app.created_at
         }
     
     def _calculate_hash(self, file_path: str) -> str:
-        """Calculate MD5 hash of file (consistent method)"""
+        """Calculate MD5 hash of file"""
         hash_md5 = hashlib.md5()
         try:
             with open(file_path, "rb") as f:
@@ -1392,8 +1406,16 @@ class EnhancedAppManager:
             return ""
     
     def get_apps(self) -> List[AppInfo]:
-        """Get all apps"""
+        """Get all apps and mods"""
         return list(self.apps.values())
+    
+    def get_applications(self) -> List[AppInfo]:
+        """Get only applications (not mods)"""
+        return [app for app in self.apps.values() if not app.is_mod]
+    
+    def get_mods(self) -> List[AppInfo]:
+        """Get only mods"""
+        return [app for app in self.apps.values() if app.is_mod]
     
     def remove_app(self, app_id: str) -> bool:
         """Remove app from registry and delete its hosted file"""
@@ -1401,133 +1423,50 @@ class EnhancedAppManager:
             app = self.apps[app_id]
             file_to_delete = Path(app.file_path)
             
-            # Delete the file from the hosted location (apps_dir or expansions_dir)
-            if file_to_delete.exists() and (file_to_delete.parent == self.apps_dir or file_to_delete.parent == self.expansions_dir):
+            if file_to_delete.exists() and (file_to_delete.parent == self.apps_dir or file_to_delete.parent == self.mods_dir):
                 try:
                     os.remove(file_to_delete)
                     logger.info(f"Deleted hosted file for {app.name}: {file_to_delete}")
                 except Exception as e:
                     logger.error(f"Error deleting hosted file for {app.name}: {e}", exc_info=True)
-                    # Don't fail removal if file deletion fails, just log it.
             else:
-                logger.warning(f"File for {app.name} not found at expected hosted path or not in managed directory: {file_to_delete}")
+                logger.warning(f"File for {app.name} not found at expected path: {file_to_delete}")
 
             del self.apps[app_id]
             self.save_apps()
-            logger.info(f"Removed app '{app.name}' (ID: {app_id}) from registry.")
+            logger.info(f"Removed {'mod' if app.is_mod else 'app'} '{app.name}' (ID: {app_id})")
             return True
         return False
-    
-    def _load_and_init_mod(self, app: AppInfo, callback=None) -> bool:
-        """
-        Loads a Python mod directly into the current process and calls its init_mod function
-        with a restricted API.
-        """
-        logger.info(f"Attempting to load and initialize mod: {app.name} from {app.file_path}")
-        
-        # Create a backup before loading, as mods run in-process and can modify anything.
-        result = messagebox.askyesno(
-            "Mod Initialization",
-            f"'{app.name}' is a mod that will run directly within the client process.\n\n"
-            "Would you like to create a backup before proceeding?\n"
-            "This allows you to restore the client if issues occur."
-        )
-        
-        if result:
-            backup_created = self._create_client_backup()
-            if not backup_created:
-                messagebox.showerror("Backup Failed", "Could not create backup. Mod initialization cancelled.")
-                return False
-
-        mod_name = Path(app.file_path).stem
-        try:
-            # Temporarily restrict imports for the mod's execution
-            original_import_builtin = __builtins__.__import__
-            __builtins__.__import__ = _restricted_import
-
-            spec = importlib.util.spec_from_file_location(mod_name, app.file_path)
-            if spec is None or spec.loader is None:
-                messagebox.showerror("Mod Load Error", f"Could not find or load spec for mod: {app.name}")
-                logger.error(f"Could not find or load spec for mod: {app.name}")
-                return False
-
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[mod_name] = module # Add to sys.modules for proper import resolution
-
-            # Execute the module's code
-            spec.loader.exec_module(module)
-
-            # Restore original import function
-            __builtins__.__import__ = original_import_builtin
-
-            # Check for the init_mod function in the loaded module
-            if hasattr(module, 'init_mod') and callable(module.init_mod):
-                logger.info(f"Calling init_mod for {app.name}")
-                # Create and pass the restricted API instance
-                mod_api = AppAPI(self.root, self.notebook, self.app_manager, logger)
-                module.init_mod(mod_api)
-                messagebox.showinfo("Mod Loaded", f"Mod '{app.name}' initialized successfully!")
-                self._record_launch(app.app_id) # Record launch after successful init
-                return True
-            else:
-                messagebox.showwarning("Mod Warning", f"Mod '{app.name}' loaded but no 'init_mod' function found. It might not function as expected.")
-                logger.warning(f"Mod '{app.name}' loaded but no 'init_mod' function found.")
-                return False
-
-        except ImportError as ie:
-            messagebox.showerror("Mod Security Error", f"Mod '{app.name}' attempted to import restricted module: {ie}. Mod not loaded.")
-            logger.error(f"Mod security violation: {ie}", exc_info=True)
-            return False
-        except Exception as e:
-            messagebox.showerror("Mod Load Error", f"Failed to load or initialize mod '{app.name}': {e}. Check logs.")
-            logger.error(f"Failed to load or initialize mod '{app.name}': {e}", exc_info=True)
-            return False
-        finally:
-            # Ensure original import function is always restored
-            __builtins__.__import__ = original_import_builtin
-
 
 # ===========================
 # MOD LOADER CLASS
 # ===========================
 
 class ModLoader:
-    """
-    Manages the discovery and registration of mods.
-    Mods are treated as 'expansions' within the EnhancedAppManager.
-    """
+    """Manages the discovery and registration of mods"""
+    
     def __init__(self, app_manager: EnhancedAppManager):
         self.app_manager = app_manager
-        # Mods are stored in the same directory as other expansions
-        self.mods_dir = app_manager.expansions_dir 
+        self.mods_dir = app_manager.mods_dir
         logger.info(f"ModLoader initialized. Mods directory: {self.mods_dir}")
 
     def scan_for_new_mods(self) -> List[AppInfo]:
-        """
-        Scans the mods directory for new Python files that could be mods.
-        Automatically registers them as expansions if not already present.
-        Returns a list of newly registered AppInfo objects for mods.
-        """
+        """Scan for new Python files that could be mods"""
         newly_registered_mods = []
         
-        # Get paths of currently registered expansions to avoid re-adding
-        registered_expansion_paths = {app.file_path for app in self.app_manager.get_apps() if app.is_expansion}
+        registered_mod_paths = {app.file_path for app in self.app_manager.get_mods()}
         
         for potential_mod_file in self.mods_dir.iterdir():
-            # We are looking for Python files as a common mod type
             if potential_mod_file.is_file() and potential_mod_file.suffix.lower() == '.py':
-                if str(potential_mod_file) not in registered_expansion_paths:
-                    logger.info(f"ModLoader: Found new potential mod file: {potential_mod_file.name}")
+                if str(potential_mod_file) not in registered_mod_paths:
+                    logger.info(f"ModLoader: Found new mod file: {potential_mod_file.name}")
                     
-                    # Add this file as an expansion
-                    # The add_app method will copy it to the managed expansions_dir
-                    # and update its file_path in the AppInfo object.
                     added_app_info = self.app_manager.add_app(
                         file_path=str(potential_mod_file),
-                        name=potential_mod_file.stem, # Use filename as default name
-                        category="Mod", # Assign a specific category for mods
+                        name=potential_mod_file.stem,
+                        category="Mod",
                         company="Community Mod",
-                        is_expansion=True
+                        is_mod=True
                     )
                     if added_app_info:
                         newly_registered_mods.append(added_app_info)
@@ -1537,14 +1476,13 @@ class ModLoader:
                 else:
                     logger.debug(f"ModLoader: Mod '{potential_mod_file.name}' already registered.")
             else:
-                logger.debug(f"ModLoader: Skipping non-Python file or directory: {potential_mod_file.name}")
+                logger.debug(f"ModLoader: Skipping non-Python file: {potential_mod_file.name}")
                 
         return newly_registered_mods
 
     def get_installed_mods(self) -> List[AppInfo]:
-        """Returns a list of all installed mods (AppInfo objects where is_expansion is True)."""
-        return [app for app in self.app_manager.get_apps() if app.is_expansion]
-
+        """Returns a list of all installed mods"""
+        return self.app_manager.get_mods()
 
 # ===========================
 # SIMPLIFIED NODE DISCOVERY
@@ -1586,7 +1524,6 @@ class SimpleNodeDiscovery:
         except Exception as e:
             logger.error(f"Node registration error: {e}", exc_info=True)
         
-        # Fallback
         self.fallback_nodes[self.auth.node_id] = {
             'node_id': self.auth.node_id,
             'username': self.auth.username,
@@ -1628,7 +1565,7 @@ class SimpleNodeDiscovery:
                             try:
                                 public_key_bytes = base64.b64decode(pub_key)
                             except:
-                                pass # Ignore decoding errors for public key
+                                pass
                         
                         nodes.append(NodeInfo(
                             node_id=node_id,
@@ -1651,7 +1588,6 @@ class SimpleNodeDiscovery:
         except Exception as e:
             logger.error(f"Error getting online nodes: {e}", exc_info=True)
         
-        # Fallback
         nodes = []
         current_time = time.time()
         
@@ -1687,7 +1623,6 @@ class SimpleNodeDiscovery:
         except Exception as e:
             logger.error(f"Heartbeat update error: {e}", exc_info=True)
         
-        # Fallback
         if self.auth.node_id in self.fallback_nodes:
             self.fallback_nodes[self.auth.node_id]['last_seen'] = time.time()
             self.fallback_nodes[self.auth.node_id]['apps_count'] = apps_count
@@ -1709,7 +1644,6 @@ class SimpleNodeDiscovery:
         except Exception as e:
             logger.error(f"Chat message send error: {e}", exc_info=True)
         
-        # Fallback
         message_data = {
             'id': len(self.fallback_messages) + 1,
             'sender_id': self.auth.node_id,
@@ -1769,7 +1703,6 @@ class SimpleNodeDiscovery:
         except Exception as e:
             logger.error(f"Error getting chat messages: {e}", exc_info=True)
         
-        # Fallback
         messages = []
         since_time = datetime.min
         
@@ -1779,8 +1712,8 @@ class SimpleNodeDiscovery:
                     since_time = datetime.strptime(since_timestamp, '%Y-%m-%d %H:%M:%S')
                 else:
                     since_time = since_timestamp
-            except ValueError: # Handle invalid timestamp format
-                logger.warning(f"Invalid since_timestamp format: {since_timestamp}. Using datetime.min.")
+            except ValueError:
+                logger.warning(f"Invalid since_timestamp format: {since_timestamp}")
                 since_time = datetime.min
         
         for msg in self.fallback_messages:
@@ -1792,34 +1725,35 @@ class SimpleNodeDiscovery:
         return messages[-50:]
     
     def register_app_availability(self, app: AppInfo, download_url: str) -> bool:
-        """Register app availability"""
+        """Register app/mod availability for network sharing"""
         try:
             success = self.db.execute("""
                 INSERT INTO app_availability (node_id, app_token, app_name, app_category, 
-                                            file_size, file_hash, download_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                            file_size, file_hash, download_url, is_mod)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     app_name = VALUES(app_name),
                     download_url = VALUES(download_url),
+                    is_mod = VALUES(is_mod),
                     last_verified = CURRENT_TIMESTAMP
             """, (
                 self.auth.node_id, app.app_token, app.name, app.category,
-                app.file_size, app.file_hash, download_url
+                app.file_size, app.file_hash, download_url, app.is_mod
             ))
             
             return success
             
         except Exception as e:
-            logger.error(f"App registration error: {e}", exc_info=True)
+            logger.error(f"App/Mod registration error: {e}", exc_info=True)
             return False
     
     def get_available_apps(self) -> List[Dict]:
-        """Get available apps"""
+        """Get available apps from network"""
         try:
             rows = self.db.query("""
                 SELECT aa.node_id, mn.username, mn.status, aa.app_token, aa.app_name, 
                        aa.app_category, aa.file_size, aa.file_hash, aa.download_url,
-                       aa.last_verified, aa.status as app_status
+                       aa.last_verified, aa.status as app_status, aa.is_mod
                 FROM app_availability aa
                 JOIN mesh_nodes mn ON aa.node_id = mn.node_id
                 WHERE mn.last_heartbeat > NOW() - INTERVAL 300 SECOND
@@ -1832,7 +1766,8 @@ class SimpleNodeDiscovery:
                 for row in rows:
                     try:
                         (node_id, username, node_status, app_token, app_name, 
-                         category, file_size, file_hash, download_url, last_verified, app_status) = row
+                         category, file_size, file_hash, download_url, last_verified, 
+                         app_status, is_mod) = row
                         
                         apps.append({
                             'node_id': node_id,
@@ -1846,7 +1781,8 @@ class SimpleNodeDiscovery:
                             'download_url': download_url,
                             'last_verified': last_verified,
                             'app_status': app_status,
-                            'available': node_status == 'online'
+                            'is_mod': bool(is_mod),
+                            'available': True  # Always true for online nodes
                         })
                     except Exception as e:
                         logger.warning(f"Error processing app row: {e}", exc_info=True)
@@ -1858,19 +1794,6 @@ class SimpleNodeDiscovery:
             logger.error(f"Error getting available apps: {e}", exc_info=True)
         
         return []
-    
-    def cleanup_old_data(self):
-        """Cleanup old data with better error handling"""
-        try:
-            current_time = time.time()
-            if current_time - self.last_cleanup > 3600:  # Cleanup every hour
-                self.db.execute("DELETE FROM chat_messages WHERE timestamp < NOW() - INTERVAL 7 DAY")
-                self.db.execute("DELETE FROM mesh_nodes WHERE last_heartbeat < NOW() - INTERVAL 1 HOUR AND status = 'offline'")
-                self.db.execute("DELETE FROM app_availability WHERE last_verified < NOW() - INTERVAL 1 DAY AND status = 'unavailable'")
-                self.last_cleanup = current_time
-                logger.info("Database cleanup completed")
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}", exc_info=True)
 
 # ===========================
 # ENHANCED AUTHENTICATION
@@ -1951,7 +1874,7 @@ class EnhancedAuth:
     def register_with_portal(self) -> bool:
         """Register node with portal for live status"""
         if not HTTP_AVAILABLE or not CONFIG['ENABLE_PORTAL']:
-            logger.info("Portal registration skipped (HTTP not available or portal disabled).")
+            logger.info("Portal registration skipped")
             return False
         
         try:
@@ -1972,150 +1895,166 @@ class EnhancedAuth:
                 logger.info("Portal registration successful")
                 return True
             else:
-                logger.warning(f"Portal registration failed: HTTP {response.status_code}. Response: {response.text}")
+                logger.warning(f"Portal registration failed: HTTP {response.status_code}")
                 return False
             
-        except requests.exceptions.Timeout:
-            logger.warning("Portal registration timeout")
-            return False
-        except requests.exceptions.ConnectionError:
-            logger.warning("Portal registration failed: Cannot connect to portal server.")
-            return False
         except Exception as e:
             logger.error(f"Portal registration failed: {e}", exc_info=True)
             return False
 
 # ===========================
-# APP API for Mods (Restricted Access)
+# DIRECT MOD API - FULL ACCESS
 # ===========================
 
-class AppAPI:
+class DirectModAPI:
     """
-    A restricted API exposed to mods for safe interaction with the main client.
-    This class acts as a proxy, only exposing methods that are safe and necessary
-    for mod functionality without compromising security (e.g., network access).
+    Direct Mod API with FULL access to the client.
+    Mods can modify anything they want through this API.
     """
-    def __init__(self, root_window: tk.Tk, notebook: ttk.Notebook, app_manager: EnhancedAppManager, logger_instance: logging.Logger):
-        self._root = root_window
-        self._notebook = notebook
-        self._app_manager = app_manager
-        self._logger = logger_instance
-        self._dynamic_tabs = {} # To keep track of dynamically added tabs by their title
-
-    def add_gui_tab(self, tab_title: str, content_type: str, content_data: str, tab_id: str = None):
-        """
-        Allows a mod to add a new tab to the main client's GUI.
+    
+    def __init__(self, gui_instance, app_manager: EnhancedAppManager, logger_instance: logging.Logger):
+        # DIRECT ACCESS - no restrictions
+        self.gui = gui_instance  # Full GUI access (for backward compatibility)
+        self.app_manager = app_manager  # Full app manager access
+        self.logger = logger_instance  # Logger access
         
-        :param tab_title: The title of the new tab.
-        :param content_type: Type of content ('text', 'markdown').
-        :param content_data: The actual content string.
-        :param tab_id: Optional unique ID for the tab. If not provided, title is used.
+        # Give mods access to the main tkinter root and notebook
+        if gui_instance:
+            self.root = gui_instance.root
+            self.notebook = gui_instance.notebook
+    
+    def add_gui_tab(self, tab_title: str, content_widget: tk.Widget = None, tab_id: str = None):
         """
-        # Ensure this call happens on the main Tkinter thread
-        self._root.after(0, lambda: self._add_dynamic_tab_internal(tab_title, content_type, content_data, tab_id))
-
-    def _add_dynamic_tab_internal(self, tab_title: str, content_type: str, content_data: str, tab_id: str = None):
-        """Internal method to add a new tab to the notebook."""
-        if tab_id is None:
-            tab_id = tab_title # Use title as ID if not provided
-
-        if tab_id in self._dynamic_tabs:
-            self._logger.warning(f"Attempted to add duplicate dynamic tab: {tab_title}. Skipping.")
-            # Optionally, switch to the existing tab
-            # self._notebook.select(self._dynamic_tabs[tab_id])
-            return
-
+        Add a new tab to the main GUI.
+        Mods can pass a fully constructed widget.
+        """
         try:
-            new_frame = tk.Frame(self._notebook, bg='#1e293b')
-            self._notebook.add(new_frame, text=tab_title)
-            self._notebook.select(new_frame) # Switch to the new tab
-
-            if content_type == 'text' or content_type == 'markdown':
-                scrolled_text = scrolledtext.ScrolledText(
-                    new_frame,
-                    wrap=tk.WORD,
-                    font=('Arial', 11),
-                    bg='#0f172a',
-                    fg='#e2e8f0',
-                    insertbackground='#e2e8f0',
-                    padx=10,
-                    pady=10
-                )
-                scrolled_text.pack(fill='both', expand=True)
-                scrolled_text.insert(tk.END, content_data)
-                scrolled_text.config(state='disabled')
+            if content_widget is not None:
+                # Add the widget directly as a tab
+                self.notebook.add(content_widget, text=tab_title)
+                self.notebook.select(content_widget)
+                self.logger.info(f"Added mod tab: '{tab_title}'")
+                return True
             else:
-                tk.Label(new_frame, text=f"Unsupported content type: {content_type}",
-                         bg='#1e293b', fg='red').pack(pady=20)
-            
-            self._dynamic_tabs[tab_id] = new_frame # Store reference to the tab's frame
-            self._logger.info(f"Dynamically added new tab: '{tab_title}'")
-
+                # Create empty frame for mod to populate
+                new_frame = tk.Frame(self.notebook, bg='#1e293b')
+                self.notebook.add(new_frame, text=tab_title)
+                self.notebook.select(new_frame)
+                self.logger.info(f"Added empty mod tab: '{tab_title}'")
+                return new_frame
+                
         except Exception as e:
-            self._logger.error(f"Error adding dynamic tab '{tab_title}': {e}", exc_info=True)
-            messagebox.showerror("Mod GUI Error", f"Mod tried to add a tab but failed: {e}")
-
+            self.logger.error(f"Error adding mod tab '{tab_title}': {e}", exc_info=True)
+            return False
+    
+    def send_broadcast_message(self, message: str):
+        """Send a broadcast message through the chat system"""
+        try:
+            if hasattr(self.gui, 'discovery'):
+                success = self.gui.discovery.send_chat_message(message, None, 'broadcast')
+                if success:
+                    # Also display locally
+                    self.gui.add_chat_message("You (Broadcast)", message, "sent")
+                return success
+            return False
+        except Exception as e:
+            self.logger.error(f"Error sending broadcast message: {e}", exc_info=True)
+            return False
+    
     def get_installed_apps_info(self) -> List[Dict[str, Any]]:
-        """
-        Returns a list of dictionaries containing safe information about installed apps.
-        Does NOT return the live AppInfo objects to prevent direct modification.
-        """
-        safe_app_info = []
-        for app in self._app_manager.get_apps():
-            safe_app_info.append({
-                "app_id": app.app_id,
-                "name": app.name,
-                "version": app.version,
-                "description": app.description,
-                "category": app.category,
-                "developer": app.developer,
-                "company": app.company,
-                "file_size": app.file_size,
-                "file_hash": app.file_hash,
-                "is_expansion": app.is_expansion,
-                "usage_time": app.usage_time,
-                "launch_count": app.launch_count,
-                "last_used": app.last_used,
-                "badges": list(app.badges) # Return a copy of the list
-            })
-        return safe_app_info
-
+        """Get information about all installed apps and mods"""
+        try:
+            return [app.to_dict() for app in self.app_manager.get_apps()]
+        except Exception as e:
+            self.logger.error(f"Error getting apps info: {e}", exc_info=True)
+            return []
+    
+    def get_network_nodes(self) -> List[Dict[str, Any]]:
+        """Get information about connected network nodes"""
+        try:
+            if hasattr(self.gui, 'connected_nodes'):
+                return [asdict(node) for node in self.gui.connected_nodes.values()]
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting network nodes: {e}", exc_info=True)
+            return []
+    
+    def modify_gui_element(self, element_name: str, property_name: str, new_value):
+        """Directly modify GUI elements - DANGEROUS but allowed"""
+        try:
+            if hasattr(self.gui, element_name):
+                element = getattr(self.gui, element_name)
+                if hasattr(element, property_name):
+                    setattr(element, property_name, new_value)
+                    self.logger.info(f"Modified {element_name}.{property_name} = {new_value}")
+                    return True
+                else:
+                    element.config(**{property_name: new_value})
+                    self.logger.info(f"Configured {element_name}.{property_name} = {new_value}")
+                    return True
+            return False
+        except Exception as e:
+            self.logger.error(f"Error modifying GUI element: {e}", exc_info=True)
+            return False
+    
+    def execute_in_gui_thread(self, func, *args, **kwargs):
+        """Execute a function in the GUI thread"""
+        try:
+            self.root.after(0, lambda: func(*args, **kwargs))
+            return True
+        except Exception as e:
+            self.logger.error(f"Error executing in GUI thread: {e}", exc_info=True)
+            return False
+    
     def log_mod_message(self, level: str, message: str):
-        """
-        Allows a mod to log messages to the main client's logger.
-        :param level: 'info', 'warning', 'error'
-        :param message: The message string.
-        """
-        if level == 'info':
-            self._logger.info(f"[MOD] {message}")
-        elif level == 'warning':
-            self._logger.warning(f"[MOD] {message}")
-        elif level == 'error':
-            self._logger.error(f"[MOD] {message}")
-        else:
-            self._logger.debug(f"[MOD] {message}") # Default to debug for unknown levels
-
-    # --- Restricted Methods (Explicitly NOT exposed or are internal) ---
-    # These methods are intentionally not exposed to mods to maintain security and control.
-    # Mods cannot directly access:
-    # - self._root (the main Tkinter window object)
-    # - self._notebook (the main ttk.Notebook object)
-    # - self._app_manager (the live AppManager instance)
-    # - Any network-related objects (sockets, requests, etc.)
-    # - Direct file system write access outside of designated areas (e.g., config files)
-    # The AppAPI acts as a controlled interface.
+        """Log a message from the mod"""
+        try:
+            # Remove emojis from log messages to prevent encoding issues
+            safe_message = message.encode('ascii', 'ignore').decode('ascii')
+            if level == 'info':
+                self.logger.info(f"[MOD] {safe_message}")
+            elif level == 'warning':
+                self.logger.warning(f"[MOD] {safe_message}")
+            elif level == 'error':
+                self.logger.error(f"[MOD] {safe_message}")
+            else:
+                self.logger.debug(f"[MOD] {safe_message}")
+        except Exception as e:
+            # Fallback logging without the problematic message
+            self.logger.error(f"[MOD] Logging error: {e}")
+    
+    # FULL ACCESS PROPERTIES - Mods can access anything
+    @property
+    def full_gui_access(self):
+        """Give mods complete access to the GUI instance"""
+        return self.gui
+    
+    @property
+    def full_app_manager_access(self):
+        """Give mods complete access to the app manager"""
+        return self.app_manager
+    
+    @property
+    def tkinter_root(self):
+        """Direct access to tkinter root"""
+        return self.root
+    
+    @property
+    def main_notebook(self):
+        """Direct access to main notebook"""
+        return self.notebook
 
 # ===========================
 # ENHANCED GUI
 # ===========================
 
 class EnhancedMonsterAppsGUI:
-    """Enhanced GUI with better error handling and all functionality"""
+    """Enhanced GUI with direct mod support"""
     
     def __init__(self):
         try:
             self.root = tk.Tk()
-            self.root.title("MonsterApps Enhanced - P2P App Distribution")
+            self.root.title("MonsterApps Enhanced - P2P App Distribution with Direct Mod Access")
             self.root.geometry("1400x900")
             self.root.configure(bg='#0f172a')
             
@@ -2123,13 +2062,13 @@ class EnhancedMonsterAppsGUI:
             style = ttk.Style()
             style.theme_use('clam')
             style.configure('Title.TLabel', font=('Arial', 16, 'bold'), foreground='#4CAF50')
-            style.configure('Expansion.TButton', background='#FF6B35', foreground='white')
+            style.configure('Mod.TButton', background='#FF6B35', foreground='white')
             style.configure('App.TButton', background='#4CAF50', foreground='white')
             
-            # Initialize components with error handling
+            # Initialize components
             self.auth = EnhancedAuth()
             self.app_manager = EnhancedAppManager()
-            self.mod_loader = ModLoader(self.app_manager) # Initialize ModLoader
+            self.mod_loader = ModLoader(self.app_manager)
             self.discovery = SimpleNodeDiscovery(self.auth)
             self.web_server = AppWebServer(self.app_manager, self.auth)
             
@@ -2140,17 +2079,17 @@ class EnhancedMonsterAppsGUI:
             self.selected_app = None
             self.service_errors = []
             
-            # Setup GUI with error handling
+            # Setup GUI
             self.setup_gui()
             self.setup_menu()
             
-            # Start services in background
+            # Start services
             threading.Thread(target=self.start_services_safe, daemon=True).start()
             
-            # Schedule periodic updates
-            self.root.after(5000, self.schedule_updates) # Initial call to schedule updates
+            # Schedule updates
+            self.root.after(5000, self.schedule_updates)
             
-            logger.info("GUI initialized successfully")
+            logger.info("GUI initialized successfully with direct mod access")
             
         except Exception as e:
             logger.error(f"GUI initialization error: {e}", exc_info=True)
@@ -2164,14 +2103,14 @@ class EnhancedMonsterAppsGUI:
             self.notebook = ttk.Notebook(self.root)
             self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
             
-            # Apps Panel
+            # Applications Panel
             apps_frame = tk.Frame(self.notebook, bg='#1e293b')
-            self.notebook.add(apps_frame, text="📱 My Apps")
+            self.notebook.add(apps_frame, text="📱 Applications")
             self.setup_apps_panel(apps_frame)
             
-            # Mods Panel (NEW)
+            # Mods Panel
             mods_frame = tk.Frame(self.notebook, bg='#1e293b')
-            self.notebook.add(mods_frame, text="⚙️ Mods")
+            self.notebook.add(mods_frame, text="🔧 Mods")
             self.setup_mods_panel(mods_frame)
             
             # Store Panel
@@ -2202,30 +2141,29 @@ class EnhancedMonsterAppsGUI:
             raise
     
     def setup_apps_panel(self, parent):
-        """Setup enhanced apps panel with detailed cards"""
+        """Setup applications panel"""
         try:
             # Header
             header = tk.Frame(parent, bg='#1e293b')
             header.pack(fill='x', padx=10, pady=5)
             
-            tk.Label(header, text="📱 My Applications", font=('Arial', 20, 'bold'),
+            tk.Label(header, text="📱 Applications", font=('Arial', 20, 'bold'),
                     fg='#4CAF50', bg='#1e293b').pack(side='left')
             
             # Controls
             controls = tk.Frame(header, bg='#1e293b')
             controls.pack(side='right')
             
-            tk.Button(controls, text="➕ Add App", command=self.add_app_dialog,
+            tk.Button(controls, text="➕ Add Application", command=self.add_app_dialog,
                      bg='#4CAF50', fg='white', font=('Arial', 10, 'bold')).pack(side='left', padx=2)
             
             tk.Button(controls, text="🔄 Refresh", command=self.refresh_apps,
                      bg='#2196F3', fg='white', font=('Arial', 10, 'bold')).pack(side='left', padx=2)
             
-            # Apps container with scrollable frame
+            # Apps container
             apps_container = tk.Frame(parent, bg='#1e293b')
             apps_container.pack(fill='both', expand=True, padx=10, pady=5)
             
-            # Canvas for scrolling
             canvas = tk.Canvas(apps_container, bg='#1e293b', highlightthickness=0)
             scrollbar = ttk.Scrollbar(apps_container, orient='vertical', command=canvas.yview)
             self.apps_scroll_frame = tk.Frame(canvas, bg='#1e293b')
@@ -2243,7 +2181,6 @@ class EnhancedMonsterAppsGUI:
             
             self.apps_canvas = canvas
             
-            # Mouse wheel scrolling
             def _on_mousewheel(event):
                 canvas.yview_scroll(int(-1*(event.delta/120)), "units")
             canvas.bind("<MouseWheel>", _on_mousewheel)
@@ -2252,33 +2189,32 @@ class EnhancedMonsterAppsGUI:
             logger.error(f"Apps panel setup error: {e}", exc_info=True)
 
     def setup_mods_panel(self, parent):
-        """Setup the new mods panel"""
+        """Setup mods panel"""
         try:
             # Header
             header = tk.Frame(parent, bg='#1e293b')
             header.pack(fill='x', padx=10, pady=5)
             
-            tk.Label(header, text="⚙️ Client Mods", font=('Arial', 20, 'bold'),
-                    fg='#FF6B35', bg='#1e293b').pack(side='left') # Mod-specific color
+            tk.Label(header, text="🔧 Client Mods (Direct Access)", font=('Arial', 20, 'bold'),
+                    fg='#FF6B35', bg='#1e293b').pack(side='left')
             
             # Controls
             controls = tk.Frame(header, bg='#1e293b')
             controls.pack(side='right')
             
-            tk.Button(controls, text="➕ Add Mod File", command=self.add_mod_file_dialog,
+            tk.Button(controls, text="➕ Add Mod", command=self.add_mod_dialog,
                      bg='#FF6B35', fg='white', font=('Arial', 10, 'bold')).pack(side='left', padx=2)
             
-            tk.Button(controls, text="🔍 Scan for New Mods", command=self.scan_for_new_mods,
+            tk.Button(controls, text="🔍 Scan for Mods", command=self.scan_for_new_mods,
                      bg='#2196F3', fg='white', font=('Arial', 10, 'bold')).pack(side='left', padx=2)
             
-            tk.Button(controls, text="🔄 Refresh Mods", command=self.refresh_mods,
+            tk.Button(controls, text="🔄 Refresh", command=self.refresh_mods,
                      bg='#2196F3', fg='white', font=('Arial', 10, 'bold')).pack(side='left', padx=2)
             
-            # Mods container with scrollable frame
+            # Mods container
             mods_container = tk.Frame(parent, bg='#1e293b')
             mods_container.pack(fill='both', expand=True, padx=10, pady=5)
             
-            # Canvas for scrolling
             canvas = tk.Canvas(mods_container, bg='#1e293b', highlightthickness=0)
             scrollbar = ttk.Scrollbar(mods_container, orient='vertical', command=canvas.yview)
             self.mods_scroll_frame = tk.Frame(canvas, bg='#1e293b')
@@ -2296,18 +2232,17 @@ class EnhancedMonsterAppsGUI:
             
             self.mods_canvas = canvas
             
-            # Mouse wheel scrolling
             def _on_mousewheel_mods(event):
                 canvas.yview_scroll(int(-1*(event.delta/120)), "units")
             canvas.bind("<MouseWheel>", _on_mousewheel_mods)
 
-            self.refresh_mods() # Initial population of mods
+            self.refresh_mods()
             
         except Exception as e:
             logger.error(f"Mods panel setup error: {e}", exc_info=True)
     
     def setup_store_panel(self, parent):
-        """Setup app store panel with availability status"""
+        """Setup app store panel"""
         try:
             # Header
             header = tk.Frame(parent, bg='#1e293b')
@@ -2316,7 +2251,6 @@ class EnhancedMonsterAppsGUI:
             tk.Label(header, text="🛒 MonsterApps Store", font=('Arial', 20, 'bold'),
                     fg='#4CAF50', bg='#1e293b').pack(side='left')
             
-            # Refresh button
             tk.Button(header, text="🔄 Refresh Store", command=self.refresh_store,
                      bg='#2196F3', fg='white', font=('Arial', 10, 'bold')).pack(side='right')
             
@@ -2330,11 +2264,10 @@ class EnhancedMonsterAppsGUI:
             search_entry.pack(side='left', fill='x', expand=True, padx=5)
             search_entry.bind('<KeyRelease>', self.on_search_change)
             
-            # Category filter
             tk.Label(search_frame, text="Category:", fg='white', bg='#1e293b').pack(side='left', padx=(10,0))
             self.category_var = tk.StringVar(value="All")
             category_combo = ttk.Combobox(search_frame, textvariable=self.category_var, width=15)
-            category_combo['values'] = ('All', 'Games', 'Utilities', 'Development', 'Graphics', 'Network', 'Business', 'Expansions', 'Mod') # Added 'Mod' category
+            category_combo['values'] = ('All', 'Games', 'Utilities', 'Development', 'Graphics', 'Network', 'Business', 'Mod')
             category_combo.pack(side='left', padx=5)
             category_combo.bind('<<ComboboxSelected>>', self.on_category_change)
             
@@ -2342,7 +2275,6 @@ class EnhancedMonsterAppsGUI:
             store_container = tk.Frame(parent, bg='#1e293b')
             store_container.pack(fill='both', expand=True, padx=10, pady=5)
             
-            # Store canvas for scrolling
             store_canvas = tk.Canvas(store_container, bg='#1e293b', highlightthickness=0)
             store_scrollbar = ttk.Scrollbar(store_container, orient='vertical', command=store_canvas.yview)
             self.store_scroll_frame = tk.Frame(store_canvas, bg='#1e293b')
@@ -2360,7 +2292,6 @@ class EnhancedMonsterAppsGUI:
             
             self.store_canvas = store_canvas
             
-            # Mouse wheel scrolling for store
             def _on_store_mousewheel(event):
                 store_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
             store_canvas.bind("<MouseWheel>", _on_store_mousewheel)
@@ -2398,7 +2329,6 @@ Client Token: {self.auth.client_token[:16]}..."""
             nodes_frame = tk.LabelFrame(parent, text="Connected Nodes", fg='white', bg='#1e293b')
             nodes_frame.pack(fill='both', expand=True, padx=10, pady=5)
             
-            # Nodes tree
             columns = ('username', 'status', 'apps', 'chat', 'last_seen')
             self.nodes_tree = ttk.Treeview(nodes_frame, columns=columns, show='tree headings')
             
@@ -2649,8 +2579,8 @@ HALT         ; Stop execution
             # File menu
             file_menu = tk.Menu(menubar, tearoff=0)
             menubar.add_cascade(label="File", menu=file_menu)
-            file_menu.add_command(label="Add App", command=self.add_app_dialog)
-            file_menu.add_command(label="Add Mod File", command=self.add_mod_file_dialog) # Added for mods
+            file_menu.add_command(label="Add Application", command=self.add_app_dialog)
+            file_menu.add_command(label="Add Mod", command=self.add_mod_dialog)
             file_menu.add_separator()
             file_menu.add_command(label="Open Portal", command=self.open_portal)
             file_menu.add_separator()
@@ -2670,7 +2600,7 @@ HALT         ; Stop execution
             tools_menu.add_command(label="Restore Backup", command=self.restore_backup)
             tools_menu.add_command(label="Clear Chat", command=self.clear_chat)
             tools_menu.add_separator()
-            tools_menu.add_command(label="Scan for New Mods", command=self.scan_for_new_mods) # Also in tools
+            tools_menu.add_command(label="Scan for New Mods", command=self.scan_for_new_mods)
             
             # Help menu
             help_menu = tk.Menu(menubar, tearoff=0)
@@ -2704,7 +2634,7 @@ HALT         ; Stop execution
                 if self.discovery.db.is_available():
                     self.root.after(0, lambda: self.update_service_status("db", "✅", "#4CAF50"))
                     
-                    # Register available apps (including expansions/mods)
+                    # Register all apps and mods
                     for app in self.app_manager.get_apps():
                         download_url = f"http://{local_ip}:{CONFIG['WEBSERVER_PORT']}/grab?ack={app.app_token}"
                         self.discovery.register_app_availability(app, download_url)
@@ -2779,7 +2709,7 @@ HALT         ; Stop execution
             self.refresh_nodes_safe()
             self.check_chat_messages_safe()
             self.refresh_apps_safe()
-            self.refresh_mods_safe() # Also refresh mods periodically
+            self.refresh_mods_safe()
             
             # Update heartbeat
             threading.Thread(target=self.update_heartbeat_safe, daemon=True).start()
@@ -2789,7 +2719,6 @@ HALT         ; Stop execution
             
         except Exception as e:
             logger.error(f"Update scheduling error: {e}", exc_info=True)
-            # Continue scheduling even if this update failed
             self.root.after(10000, self.schedule_updates)
     
     @safe_thread_wrapper
@@ -2806,7 +2735,7 @@ HALT         ; Stop execution
     # ===========================
     
     def create_app_card(self, app: AppInfo, parent_frame):
-        """Create enhanced app card with animations and details"""
+        """Create enhanced app/mod card"""
         try:
             # Main card frame
             card = tk.Frame(parent_frame, bg='#2d3748', relief='raised', bd=2)
@@ -2820,9 +2749,9 @@ HALT         ; Stop execution
             name_frame = tk.Frame(header, bg='#2d3748')
             name_frame.pack(side='left', fill='x', expand=True)
             
-            # App type indicator (now distinguishes between APP and MOD)
-            app_type_text = "🔧 MOD" if app.is_expansion else "📱 APP"
-            type_color = '#FF6B35' if app.is_expansion else '#4CAF50'
+            # App type indicator
+            app_type_text = "🔧 MOD" if app.is_mod else "📱 APP"
+            type_color = '#FF6B35' if app.is_mod else '#4CAF50'
             
             tk.Label(name_frame, text=app_type_text, fg=type_color, bg='#2d3748', 
                     font=('Arial', 8, 'bold')).pack(anchor='w')
@@ -2834,9 +2763,7 @@ HALT         ; Stop execution
                     fg='#a0aec0', bg='#2d3748', font=('Arial', 9)).pack(anchor='w')
             
             # Launch button
-            button_text = "▶️ Launch"
-            if app.is_expansion:
-                button_text = "⚙️ Run Mod" # Changed text for mods
+            button_text = "⚙️ Load Mod" if app.is_mod else "▶️ Launch"
             
             launch_btn = tk.Button(header, text=button_text,
                                   bg=type_color, fg='white', font=('Arial', 10, 'bold'),
@@ -2870,12 +2797,12 @@ HALT         ; Stop execution
                 badges_frame = tk.Frame(card, bg='#2d3748')
                 badges_frame.pack(fill='x', padx=10, pady=(0, 5))
                 
-                for badge in app.badges[:3]:  # Show max 3 badges
+                for badge in app.badges[:3]:
                     badge_label = tk.Label(badges_frame, text=badge, fg='#ffd700', bg='#1a202c',
                                          font=('Arial', 8), padx=3, pady=1)
                     badge_label.pack(side='left', padx=(0, 2))
             
-            # Description (collapsible)
+            # Description
             if len(app.description) > 50:
                 desc_text = app.description[:50] + "..."
             else:
@@ -2893,11 +2820,8 @@ HALT         ; Stop execution
                                            command=lambda: self.edit_app_details(app.app_id))
                     context_menu.add_command(label="📊 View Stats", 
                                            command=lambda: self.show_detailed_stats(app.app_id))
-                    
-                    if not app.is_expansion: # Only allow sharing regular apps
-                        context_menu.add_command(label="📤 Share to Network", 
-                                               command=lambda: self.share_app_to_network(app.app_id))
-                    
+                    context_menu.add_command(label="📤 Share to Network", 
+                                           command=lambda: self.share_app_to_network(app.app_id))
                     context_menu.add_command(label="🗑️ Remove", 
                                            command=lambda: self.remove_app(app.app_id))
                     
@@ -2931,12 +2855,12 @@ HALT         ; Stop execution
             info_frame = tk.Frame(header, bg='#2d3748')
             info_frame.pack(side='left', fill='x', expand=True)
             
-            # Availability indicator
-            available = app_data.get('available', False)
-            status_color = '#4CAF50' if available else '#f44336'
-            status_text = "🟢 ONLINE" if available else "🔴 OFFLINE"
+            # Type and availability indicator
+            is_mod = app_data.get('is_mod', False)
+            type_text = "🔧 MOD" if is_mod else "📱 APP"
+            type_color = '#FF6B35' if is_mod else '#4CAF50'
             
-            tk.Label(info_frame, text=status_text, fg=status_color, bg='#2d3748',
+            tk.Label(info_frame, text=f"🟢 ONLINE {type_text}", fg=type_color, bg='#2d3748',
                     font=('Arial', 8, 'bold')).pack(anchor='w')
             
             tk.Label(info_frame, text=app_data['app_name'], fg='white', bg='#2d3748',
@@ -2947,14 +2871,10 @@ HALT         ; Stop execution
                     font=('Arial', 9)).pack(anchor='w')
             
             # Download button
-            if available:
-                download_btn = tk.Button(header, text="⬇️ Download", bg='#4CAF50', fg='white',
-                                       font=('Arial', 10, 'bold'),
-                                       command=lambda: self.download_app_from_store(app_data))
-                download_btn.pack(side='right')
-            else:
-                tk.Label(header, text="⏳ Offline", fg='#f44336', bg='#2d3748',
-                        font=('Arial', 10, 'bold')).pack(side='right')
+            download_btn = tk.Button(header, text="⬇️ Download", bg=type_color, fg='white',
+                                   font=('Arial', 10, 'bold'),
+                                   command=lambda: self.download_app_from_store(app_data))
+            download_btn.pack(side='right')
             
             # Details
             details_frame = tk.Frame(item, bg='#2d3748')
@@ -2966,7 +2886,6 @@ HALT         ; Stop execution
             tk.Label(details_frame, text=f"{size_text} | {downloads_text}", 
                     fg='#a0aec0', bg='#2d3748', font=('Arial', 9)).pack(side='left')
             
-            # Last verified
             last_verified = app_data.get('last_verified', 'Unknown')
             tk.Label(details_frame, text=f"Last seen: {last_verified}", 
                     fg='#a0aec0', bg='#2d3748', font=('Arial', 9)).pack(side='right')
@@ -2982,16 +2901,16 @@ HALT         ; Stop execution
             logger.error(f"Apps refresh scheduling error: {e}", exc_info=True)
     
     def refresh_apps(self):
-        """Refresh the apps display (excluding mods/expansions)"""
+        """Refresh the applications display"""
         try:
             # Clear existing app cards
             for widget in self.apps_scroll_frame.winfo_children():
                 widget.destroy()
             
-            # Create new app cards (only regular apps)
-            apps = [app for app in self.app_manager.get_apps() if not app.is_expansion]
+            # Create new app cards (only applications)
+            apps = self.app_manager.get_applications()
             if not apps:
-                tk.Label(self.apps_scroll_frame, text="No regular apps installed\nClick 'Add App' to get started!",
+                tk.Label(self.apps_scroll_frame, text="No applications installed\nClick 'Add Application' to get started!",
                         fg='#a0aec0', bg='#1e293b', font=('Arial', 12), justify='center').pack(pady=50)
             else:
                 for app in sorted(apps, key=lambda x: x.name):
@@ -3019,13 +2938,27 @@ HALT         ; Stop execution
                 widget.destroy()
             
             # Create new mod cards
-            mods = self.mod_loader.get_installed_mods()
+            mods = self.app_manager.get_mods()
             if not mods:
-                tk.Label(self.mods_scroll_frame, text="No mods installed.\nAdd mod files or click 'Scan for New Mods'!",
-                        fg='#a0aec0', bg='#1e293b', font=('Arial', 12), justify='center').pack(pady=50)
+                info_frame = tk.Frame(self.mods_scroll_frame, bg='#1e293b')
+                info_frame.pack(pady=50)
+                
+                tk.Label(info_frame, text="⚠️ WARNING: DIRECT MOD ACCESS", 
+                        fg='#FF6B35', bg='#1e293b', font=('Arial', 14, 'bold')).pack(pady=5)
+                tk.Label(info_frame, text="Mods have FULL access to modify the client.\nThey can break the client - this is intentional for maximum flexibility.",
+                        fg='#a0aec0', bg='#1e293b', font=('Arial', 11), justify='center').pack(pady=5)
+                tk.Label(info_frame, text="No mods installed.\nAdd mod files or click 'Scan for Mods'!",
+                        fg='#a0aec0', bg='#1e293b', font=('Arial', 12), justify='center').pack(pady=10)
             else:
+                # Warning header
+                warning_frame = tk.Frame(self.mods_scroll_frame, bg='#FF6B35', relief='raised', bd=2)
+                warning_frame.pack(fill='x', padx=5, pady=5)
+                
+                tk.Label(warning_frame, text="⚠️ MODS HAVE DIRECT CLIENT ACCESS - CAN MODIFY ANYTHING", 
+                        fg='white', bg='#FF6B35', font=('Arial', 12, 'bold')).pack(pady=5)
+                
                 for mod_app in sorted(mods, key=lambda x: x.name):
-                    self.create_app_card(mod_app, self.mods_scroll_frame) # Use the same card style
+                    self.create_app_card(mod_app, self.mods_scroll_frame)
             
             # Update canvas scroll region
             self.mods_scroll_frame.update_idletasks()
@@ -3042,7 +2975,7 @@ HALT         ; Stop execution
                 widget.destroy()
             
             # Show loading message
-            loading_label = tk.Label(self.store_scroll_frame, text="🔄 Loading apps from network...",
+            loading_label = tk.Label(self.store_scroll_frame, text="🔄 Loading applications and mods from network...",
                                    fg='#ffa500', bg='#1e293b', font=('Arial', 12))
             loading_label.pack(pady=20)
             
@@ -3073,30 +3006,51 @@ HALT         ; Stop execution
                 widget.destroy()
             
             if not apps:
-                tk.Label(self.store_scroll_frame, text="No apps available in network\nConnect to more nodes to see apps!",
+                tk.Label(self.store_scroll_frame, text="No applications or mods available in network\nConnect to more nodes to see content!",
                         fg='#a0aec0', bg='#1e293b', font=('Arial', 12), justify='center').pack(pady=50)
             else:
-                # Group by category
-                categorized = {}
-                for app in apps:
-                    category = app['category']
-                    if category not in categorized:
-                        categorized[category] = []
-                    categorized[category].append(app)
+                # Separate apps and mods
+                mods = [app for app in apps if app.get('is_mod', False)]
+                applications = [app for app in apps if not app.get('is_mod', False)]
                 
-                # Display by category
-                for category, category_apps in categorized.items():
-                    # Category header
-                    cat_frame = tk.Frame(self.store_scroll_frame, bg='#1e293b')
-                    cat_frame.pack(fill='x', padx=5, pady=(10, 5))
+                # Display mods section if any
+                if mods:
+                    mod_header = tk.Frame(self.store_scroll_frame, bg='#1e293b')
+                    mod_header.pack(fill='x', padx=5, pady=(10, 5))
                     
-                    tk.Label(cat_frame, text=f"📂 {category} ({len(category_apps)} apps)",
-                            fg='#4CAF50', bg='#1e293b', font=('Arial', 14, 'bold')).pack(anchor='w')
+                    tk.Label(mod_header, text=f"🔧 Available Mods ({len(mods)})",
+                            fg='#FF6B35', bg='#1e293b', font=('Arial', 16, 'bold')).pack(anchor='w')
                     
-                    # Apps in category
-                    for app in sorted(category_apps, key=lambda x: x['app_name']):
-                        if self._should_show_app(app):
-                            self.create_store_item(app, self.store_scroll_frame)
+                    for mod in sorted(mods, key=lambda x: x['app_name']):
+                        if self._should_show_app(mod):
+                            self.create_store_item(mod, self.store_scroll_frame)
+                
+                # Display apps by category
+                if applications:
+                    categorized = {}
+                    for app in applications:
+                        category = app['category']
+                        if category not in categorized:
+                            categorized[category] = []
+                        categorized[category].append(app)
+                    
+                    if mods:
+                        # Add separator between mods and apps
+                        separator = tk.Frame(self.store_scroll_frame, bg='#4CAF50', height=2)
+                        separator.pack(fill='x', padx=20, pady=10)
+                    
+                    for category, category_apps in categorized.items():
+                        # Category header
+                        cat_frame = tk.Frame(self.store_scroll_frame, bg='#1e293b')
+                        cat_frame.pack(fill='x', padx=5, pady=(10, 5))
+                        
+                        tk.Label(cat_frame, text=f"📂 {category} ({len(category_apps)} apps)",
+                                fg='#4CAF50', bg='#1e293b', font=('Arial', 14, 'bold')).pack(anchor='w')
+                        
+                        # Apps in category
+                        for app in sorted(category_apps, key=lambda x: x['app_name']):
+                            if self._should_show_app(app):
+                                self.create_store_item(app, self.store_scroll_frame)
             
             # Update canvas scroll region
             self.store_scroll_frame.update_idletasks()
@@ -3115,8 +3069,13 @@ HALT         ; Stop execution
             
             # Category filter
             category_filter = self.category_var.get()
-            if category_filter != "All" and category_filter != app['category']:
-                return False
+            if category_filter != "All":
+                if app.get('is_mod', False) and category_filter == "Mod":
+                    return True
+                elif not app.get('is_mod', False) and category_filter == app['category']:
+                    return True
+                else:
+                    return False
             
             return True
         except Exception as e:
@@ -3139,23 +3098,22 @@ HALT         ; Stop execution
     # ===========================
     
     def add_app_dialog(self):
-        """Show add app dialog (for regular apps)"""
-        self._show_add_dialog(is_expansion=False)
+        """Show add application dialog"""
+        self._show_add_dialog(is_mod=False)
     
-    def add_mod_file_dialog(self):
-        """Show add mod file dialog (for mods, which are expansions)"""
-        self._show_add_dialog(is_expansion=True)
+    def add_mod_dialog(self):
+        """Show add mod dialog"""
+        self._show_add_dialog(is_mod=True)
     
-    def _show_add_dialog(self, is_expansion=False):
+    def _show_add_dialog(self, is_mod=False):
         """Show app/mod add dialog"""
         try:
-            dialog_title = "Add Mod" if is_expansion else "Add Application"
+            dialog_title = "Add Mod" if is_mod else "Add Application"
             
             file_path = filedialog.askopenfilename(
                 title=f"Select {dialog_title}",
                 filetypes=[
-                    ("Python files", "*.py"), # Prioritize Python for mods/expansions
-                    ("Executable files", "*.exe *.app"),
+                    ("Python files", "*.py") if is_mod else ("Executable files", "*.exe *.app"),
                     ("Java files", "*.jar"),
                     ("All files", "*.*")
                 ]
@@ -3164,21 +3122,21 @@ HALT         ; Stop execution
             if file_path:
                 dialog = tk.Toplevel(self.root)
                 dialog.title(dialog_title)
-                dialog.geometry("500x400")
+                dialog.geometry("500x500")
                 dialog.configure(bg='#1e293b')
                 dialog.transient(self.root)
                 dialog.grab_set()
                 
                 # Header
-                header_color = '#FF6B35' if is_expansion else '#4CAF50'
-                tk.Label(dialog, text=f"{'⚙️' if is_expansion else '📱'} {dialog_title}", 
+                header_color = '#FF6B35' if is_mod else '#4CAF50'
+                tk.Label(dialog, text=f"{'🔧' if is_mod else '📱'} {dialog_title}", 
                         font=('Arial', 16, 'bold'), fg=header_color, bg='#1e293b').pack(pady=20)
                 
                 # Form
                 form_frame = tk.Frame(dialog, bg='#1e293b')
                 form_frame.pack(fill='both', expand=True, padx=20, pady=10)
                 
-                # App name
+                # Name
                 tk.Label(form_frame, text="Name:", fg='white', bg='#1e293b').pack(anchor='w')
                 name_entry = tk.Entry(form_frame, width=50, font=('Arial', 11))
                 name_entry.pack(fill='x', pady=(0, 10))
@@ -3188,13 +3146,13 @@ HALT         ; Stop execution
                 tk.Label(form_frame, text="Company/Developer:", fg='white', bg='#1e293b').pack(anchor='w')
                 company_entry = tk.Entry(form_frame, width=50, font=('Arial', 11))
                 company_entry.pack(fill='x', pady=(0, 10))
-                company_entry.insert(0, "Local Developer" if not is_expansion else "Mod Author")
+                company_entry.insert(0, "Mod Author" if is_mod else "Local Developer")
                 
                 # Category
                 tk.Label(form_frame, text="Category:", fg='white', bg='#1e293b').pack(anchor='w')
-                category_var = tk.StringVar(value="Mod" if is_expansion else "Utilities") # Default to "Mod"
+                category_var = tk.StringVar(value="Mod" if is_mod else "Utilities")
                 category_combo = ttk.Combobox(form_frame, textvariable=category_var, width=47)
-                if is_expansion:
+                if is_mod:
                     category_combo['values'] = ('Mod', 'Client Tool', 'Plugin', 'Utility')
                 else:
                     category_combo['values'] = ('Games', 'Utilities', 'Development', 'Graphics', 'Network', 'Business')
@@ -3204,17 +3162,17 @@ HALT         ; Stop execution
                 tk.Label(form_frame, text="Description:", fg='white', bg='#1e293b').pack(anchor='w')
                 desc_text = scrolledtext.ScrolledText(form_frame, height=6, wrap=tk.WORD)
                 desc_text.pack(fill='x', pady=(0, 10))
-                desc_text.insert('1.0', f"{'Mod' if is_expansion else 'Application'} added from {file_path}")
+                desc_text.insert('1.0', f"{'Mod' if is_mod else 'Application'} added from {file_path}")
                 
-                # Warning for expansions/mods
-                if is_expansion:
+                # Warning for mods
+                if is_mod:
                     warning_frame = tk.Frame(form_frame, bg='#FF6B35', relief='raised', bd=2)
                     warning_frame.pack(fill='x', pady=10)
                     
-                    tk.Label(warning_frame, text="⚠️ WARNING: MOD / EXPANSION", 
+                    tk.Label(warning_frame, text="⚠️ WARNING: DIRECT CLIENT ACCESS", 
                             font=('Arial', 12, 'bold'), fg='white', bg='#FF6B35').pack(pady=5)
-                    tk.Label(warning_frame, text="This mod will run directly within the client process. A backup will be created automatically before launch.",
-                            fg='white', bg='#FF6B35', wraplength=400).pack(pady=(0, 5))
+                    tk.Label(warning_frame, text="This mod will have FULL access to modify the client GUI and functionality.\nIt can break the client - this is intentional for maximum flexibility.\nA backup will be offered before loading.",
+                            fg='white', bg='#FF6B35', wraplength=400, justify='center').pack(pady=(0, 5))
                 
                 # Buttons
                 button_frame = tk.Frame(form_frame, bg='#1e293b')
@@ -3228,20 +3186,19 @@ HALT         ; Stop execution
                         description = desc_text.get('1.0', tk.END).strip()
                         
                         if name:
-                            added_app = self.app_manager.add_app(file_path, name, category, company, is_expansion)
+                            added_app = self.app_manager.add_app(file_path, name, category, company, is_mod)
                             if added_app:
                                 messagebox.showinfo("Success", f"{dialog_title} added successfully!")
                                 dialog.destroy()
-                                if is_expansion:
+                                if is_mod:
                                     self.refresh_mods()
                                 else:
                                     self.refresh_apps()
                                 
-                                # Register with network if it's a regular app (mods are local)
-                                if not is_expansion:
-                                    local_ip = self._get_local_ip()
-                                    download_url = f"http://{local_ip}:{CONFIG['WEBSERVER_PORT']}/grab?ack={added_app.app_token}"
-                                    self.discovery.register_app_availability(added_app, download_url)
+                                # Register with network
+                                local_ip = self._get_local_ip()
+                                download_url = f"http://{local_ip}:{CONFIG['WEBSERVER_PORT']}/grab?ack={added_app.app_token}"
+                                self.discovery.register_app_availability(added_app, download_url)
                             else:
                                 messagebox.showerror("Error", f"Failed to add {dialog_title.lower()}. It might already exist.")
                         else:
@@ -3250,7 +3207,7 @@ HALT         ; Stop execution
                         logger.error(f"Add item error: {e}", exc_info=True)
                         messagebox.showerror("Error", f"Failed to add {dialog_title.lower()}: {e}")
                 
-                button_color = '#FF6B35' if is_expansion else '#4CAF50'
+                button_color = '#FF6B35' if is_mod else '#4CAF50'
                 tk.Button(button_frame, text=f"Add {dialog_title}", command=add_item,
                          bg=button_color, fg='white', font=('Arial', 12, 'bold')).pack(side='left')
                 
@@ -3262,31 +3219,34 @@ HALT         ; Stop execution
             messagebox.showerror("Error", f"Failed to open add dialog: {e}")
     
     def launch_app(self, app_id: str):
-        """Launch application or mod (expansion)"""
+        """Launch application or load mod"""
         try:
             app = self.app_manager.apps.get(app_id)
             if not app:
-                messagebox.showerror("Launch Error", "Application/Mod not found.")
+                messagebox.showerror("Launch Error", "Item not found.")
                 return
 
-            # _load_and_init_mod now handles both launching and tracking for expansions
-            success = self.app_manager.launch_app(app_id, self.on_app_usage_update) 
+            success = self.app_manager.launch_app(app_id, self.on_app_usage_update, gui_instance=self)
             if success:
-                self.status_label.config(text=f"Launched: {app.name}")
+                item_type = "mod" if app.is_mod else "application"
+                self.status_label.config(text=f"{'Loaded' if app.is_mod else 'Launched'}: {app.name}")
+                if app.is_mod:
+                    # Refresh the mods display since the mod might have modified the GUI
+                    self.root.after(1000, self.refresh_mods)
             else:
-                messagebox.showerror("Launch Error", f"Failed to launch {app.name}. Check logs for details.")
+                item_type = "mod" if app.is_mod else "application"
+                messagebox.showerror("Launch Error", f"Failed to {'load' if app.is_mod else 'launch'} {app.name}. Check logs for details.")
         except Exception as e:
-            logger.error(f"Launch app/mod error: {e}", exc_info=True)
-            messagebox.showerror("Launch Error", f"Failed to launch application/mod: {e}")
-    
+            logger.error(f"Launch error: {e}", exc_info=True)
+            messagebox.showerror("Launch Error", f"Failed to launch item: {e}")
+
     def on_app_usage_update(self, app_id: str, duration: float):
         """Handle app usage update"""
         try:
             app = self.app_manager.apps.get(app_id)
             if app:
                 self.status_label.config(text=f"Session ended: {app.name} ({duration:.1f}s)")
-                # Refresh relevant tab to show updated stats
-                if app.is_expansion:
+                if app.is_mod:
                     self.refresh_mods()
                 else:
                     self.refresh_apps()
@@ -3294,7 +3254,7 @@ HALT         ; Stop execution
             logger.error(f"Usage update error: {e}", exc_info=True)
 
     def scan_for_new_mods(self):
-        """Trigger mod loader to scan for new mods and refresh display."""
+        """Trigger mod loader to scan for new mods"""
         try:
             new_mods = self.mod_loader.scan_for_new_mods()
             if new_mods:
@@ -3337,7 +3297,6 @@ HALT         ; Stop execution
                 status_icon = {"online": "🟢", "busy": "🟡", "offline": "🔴"}.get(node.status, "⚪")
                 chat_status = "✅" if node.chat_enabled else "❌"
                 
-                # Format last_seen timestamp
                 last_seen_dt = datetime.fromtimestamp(node.last_seen)
                 now = datetime.now()
                 delta = now - last_seen_dt
@@ -3366,13 +3325,12 @@ HALT         ; Stop execution
                 if node.chat_enabled:
                     targets.append(f"{node.username} ({node.node_id[:8]})")
             
-            # Preserve current selection if possible
             current_selection = self.chat_target_var.get()
             self.chat_target_combo['values'] = targets
             if current_selection in targets:
                 self.chat_target_var.set(current_selection)
             else:
-                self.chat_target_var.set('Broadcast') # Default if current target is gone
+                self.chat_target_var.set('Broadcast')
         except Exception as e:
             logger.error(f"Chat targets update error: {e}", exc_info=True)
     
@@ -3386,7 +3344,7 @@ HALT         ; Stop execution
                 if node and node.chat_enabled:
                     target_text = f"{node.username} ({node.node_id[:8]})"
                     self.chat_target_var.set(target_text)
-                    self.notebook.select(self.notebook.index("💬 Chat"))  # Switch to chat tab by name
+                    self.notebook.select(self.notebook.index("💬 Chat"))
                     self.chat_entry.focus()
         except Exception as e:
             logger.error(f"Node double-click error: {e}", exc_info=True)
@@ -3399,9 +3357,7 @@ HALT         ; Stop execution
     def check_chat_messages_safe(self):
         """Check chat messages with error handling"""
         try:
-            # Convert last_chat_check (float timestamp) to datetime object for comparison
             since_timestamp_dt = datetime.fromtimestamp(self.last_chat_check, tz=timezone.utc)
-            # Format to string for MySQL query if needed, or pass datetime object if connector supports it
             since_timestamp_str = since_timestamp_dt.strftime('%Y-%m-%d %H:%M:%S')
             
             messages = self.discovery.get_chat_messages(since_timestamp_str)
@@ -3409,7 +3365,7 @@ HALT         ; Stop execution
             if messages:
                 for msg in messages:
                     self.root.after(0, lambda m=msg: self._display_chat_message_safe(m))
-                self.last_chat_check = time.time() # Update last check time after processing
+                self.last_chat_check = time.time()
                 
         except Exception as e:
             logger.error(f"Chat check error: {e}", exc_info=True)
@@ -3425,15 +3381,14 @@ HALT         ; Stop execution
             if isinstance(timestamp, datetime):
                 timestamp_str = timestamp.strftime('%H:%M:%S')
             elif isinstance(timestamp, str):
-                # Assuming string is already in a displayable format or needs stripping
-                timestamp_str = timestamp.split(' ')[-1][:8] # e.g., "YYYY-MM-DD HH:MM:SS" -> "HH:MM:SS"
+                timestamp_str = timestamp.split(' ')[-1][:8]
             else:
                 timestamp_str = "Unknown Time"
             
             if msg_type == 'broadcast':
                 self.add_chat_message(f"{sender} (Broadcast)", content, "broadcast", timestamp_str)
             else:
-                self.add_chat_message(sender, content, "received", timestamp_str) # Explicitly 'received' for incoming direct
+                self.add_chat_message(sender, content, "received", timestamp_str)
         except Exception as e:
             logger.error(f"Chat display error: {e}", exc_info=True)
     
@@ -3446,15 +3401,12 @@ HALT         ; Stop execution
             
             target_display_name = self.chat_target_var.get()
             
-            # Determine message type and target node_id
             if target_display_name == "Broadcast":
                 message_type = "broadcast"
                 target_node_id = None
                 display_target = "Broadcast"
             else:
                 message_type = "direct"
-                # Extract node ID from target string (e.g., "Username (node_id_prefix)")
-                # Find the full node_id from self.connected_nodes
                 target_node_id_prefix = target_display_name.split('(')[-1].split(')')[0]
                 target_node_id = None
                 for node_id, node_info in self.connected_nodes.items():
@@ -3464,23 +3416,20 @@ HALT         ; Stop execution
                 
                 if not target_node_id:
                     messagebox.showerror("Chat Error", "Selected recipient not found or offline.")
-                    logger.warning(f"Attempted to send direct message to unknown target: {target_display_name}")
                     return
                 display_target = target_display_name.split(' (')[0]
             
-            # Send message via discovery service
             success = self.discovery.send_chat_message(message, target_node_id, message_type)
             
             if success:
-                # Display in local chat immediately
                 if message_type == "broadcast":
                     self.add_chat_message("You (Broadcast)", message, "sent")
                 else:
                     self.add_chat_message(f"You → {display_target}", message, "sent")
                 
-                self.chat_entry.delete(0, tk.END) # Clear input field
+                self.chat_entry.delete(0, tk.END)
             else:
-                messagebox.showerror("Chat Error", "Failed to send message. Database or network issue.")
+                messagebox.showerror("Chat Error", "Failed to send message.")
                 
         except Exception as e:
             logger.error(f"Send chat message error: {e}", exc_info=True)
@@ -3494,32 +3443,27 @@ HALT         ; Stop execution
             
             self.chat_text.config(state='normal')
             
-            # Color coding
             colors = {
-                "system": "#ffa500",    # Orange for system messages
-                "broadcast": "#4CAF50", # Green for broadcast messages
-                "direct": "#2196F3",    # Blue for direct messages (received)
-                "sent": "#FF9800",      # Orange for messages sent by self
-                "received": "#e2e8f0"   # Light gray for general received messages
+                "system": "#ffa500",
+                "broadcast": "#4CAF50",
+                "direct": "#2196F3",
+                "sent": "#FF9800",
+                "received": "#e2e8f0"
             }
             
-            color = colors.get(msg_type, "#e2e8f0") # Default to light gray
+            color = colors.get(msg_type, "#e2e8f0")
             
-            # Insert message
             self.chat_text.insert(tk.END, f"[{timestamp}] {sender}: {message}\n")
             
-            # Apply color to last line
-            # The 'end-2c' is crucial to avoid including the final newline in the tag range
             line_start = self.chat_text.index("end-2c linestart")
             line_end = self.chat_text.index("end-2c lineend")
             
-            # Use a unique tag name to avoid conflicts if tags are reused
-            tag_name = f"msg_{msg_type}_{int(time.time() * 1000)}" # Use milliseconds for uniqueness
+            tag_name = f"msg_{msg_type}_{int(time.time() * 1000)}"
             self.chat_text.tag_add(tag_name, line_start, line_end)
             self.chat_text.tag_config(tag_name, foreground=color)
             
             self.chat_text.config(state='disabled')
-            self.chat_text.see(tk.END) # Scroll to the end
+            self.chat_text.see(tk.END)
             
         except Exception as e:
             logger.error(f"Add chat message error: {e}", exc_info=True)
@@ -3533,10 +3477,8 @@ HALT         ; Stop execution
         try:
             code = self.cpu_code_text.get('1.0', tk.END).strip()
             
-            # Assemble code
             bytecode = self.cpu.assemble(code)
             
-            # Load and run
             self.cpu.load_program(bytecode)
             cycles = self.cpu.run(max_cycles=1000)
             
@@ -3553,12 +3495,12 @@ HALT         ; Stop execution
             if not hasattr(self.cpu, 'program') or not self.cpu.program:
                 code = self.cpu_code_text.get('1.0', tk.END).strip()
                 if not code:
-                    messagebox.showwarning("CPU Warning", "No assembly code to load. Please enter a program.")
+                    messagebox.showwarning("CPU Warning", "No assembly code to load.")
                     return
                 bytecode = self.cpu.assemble(code)
                 self.cpu.load_program(bytecode)
             
-            if self.cpu.running: # Only step if CPU is still running
+            if self.cpu.running:
                 if self.cpu.step():
                     self.update_cpu_display()
                     self.status_label.config(text="CPU stepped one instruction")
@@ -3585,34 +3527,30 @@ HALT         ; Stop execution
         try:
             state = self.cpu.get_state()
             
-            # Update registers
             for reg, value in state['registers'].items():
                 self.cpu_reg_labels[reg].config(text=str(value))
             
-            # Update CPU state
             self.cpu_state_labels['PC'].config(text=str(state['pc']))
             self.cpu_state_labels['SP'].config(text=str(state['sp']))
             
-            # Update flags
             for flag, value in state['flags'].items():
                 self.cpu_flag_labels[flag].config(
                     text="1" if value else "0",
                     fg='#4CAF50' if value else '#f44336'
                 )
             
-            # Update memory view
             self.cpu_memory_text.config(state='normal')
             self.cpu_memory_text.delete('1.0', tk.END)
             
             memory_view = ""
-            for i in range(0, 16, 4): # Display first 16 bytes for brevity
+            for i in range(0, 16, 4):
                 row = f"0x{i:02X}: "
                 for j in range(4):
                     addr = i + j
                     if addr < len(self.cpu.memory):
                         row += f"{self.cpu.memory[addr]:02X} "
                     else:
-                        row += "?? " # Indicate uninitialized/out of bounds
+                        row += "?? "
                 memory_view += row + "\n"
             
             self.cpu_memory_text.insert('1.0', memory_view)
@@ -3655,9 +3593,8 @@ HALT         ; Stop execution
     def on_search_change(self, event):
         """Handle search text change"""
         try:
-            # Refresh store with filter (debounced)
             if hasattr(self, 'store_scroll_frame'):
-                self.root.after(100, self.refresh_store)  # Debounce
+                self.root.after(100, self.refresh_store)
         except Exception as e:
             logger.error(f"Search change error: {e}", exc_info=True)
     
@@ -3672,55 +3609,51 @@ HALT         ; Stop execution
         """Download app from store"""
         try:
             download_url = app_data['download_url']
+            is_mod = app_data.get('is_mod', False)
             
             self.status_label.config(text=f"Downloading: {app_data['app_name']}...")
-            self.root.update_idletasks() # Force GUI update
+            self.root.update_idletasks()
             
-            # Download file
             response = requests.get(download_url, timeout=30)
             if response.status_code == 200:
-                # Verify hash
                 received_hash = hashlib.md5(response.content).hexdigest()
                 expected_hash = app_data['file_hash']
                 
                 if received_hash == expected_hash:
-                    # Determine target directory based on category
-                    is_expansion_or_mod = app_data['category'] in ['Expansions', 'Mod', 'Client Tool', 'Plugin']
-                    target_dir = self.app_manager.expansions_dir if is_expansion_or_mod else self.app_manager.apps_dir
-
-                    # Save file to the appropriate directory
-                    filename = f"{app_data['app_name']}{Path(download_url).suffix or '.exe'}" # Try to infer suffix
-                    file_path = target_dir / filename
+                    # Get appropriate extension
+                    extension = '.py' if is_mod else '.exe'
+                    filename = f"{app_data['app_name']}{extension}"
+                    file_path = (self.app_manager.mods_dir if is_mod else self.app_manager.apps_dir) / filename
                     
                     with open(file_path, 'wb') as f:
                         f.write(response.content)
                     
-                    # Add to local apps/mods registry
                     added_app = self.app_manager.add_app(
                         str(file_path), 
                         app_data['app_name'], 
                         app_data['category'],
                         app_data.get('company', 'Downloaded'),
-                        is_expansion=is_expansion_or_mod
+                        is_mod=is_mod
                     )
                     
                     if added_app:
-                        messagebox.showinfo("Success", f"Downloaded and installed: {app_data['app_name']}")
-                        if is_expansion_or_mod:
+                        item_type = "mod" if is_mod else "application"
+                        messagebox.showinfo("Success", f"Downloaded and installed {item_type}: {app_data['app_name']}")
+                        if is_mod:
                             self.refresh_mods()
-                            self.notebook.select(self.notebook.index("⚙️ Mods")) # Switch to mods tab
+                            self.notebook.select(self.notebook.index("🔧 Mods"))
                         else:
                             self.refresh_apps()
-                            self.notebook.select(self.notebook.index("📱 My Apps")) # Switch to apps tab
+                            self.notebook.select(self.notebook.index("📱 Applications"))
                     else:
-                        messagebox.showwarning("Warning", f"Downloaded '{app_data['app_name']}' but failed to register it locally.")
+                        messagebox.showwarning("Warning", f"Downloaded '{app_data['app_name']}' but failed to register it.")
 
                 else:
-                    messagebox.showerror("Error", "File verification failed - corrupt download. Hash mismatch.")
+                    messagebox.showerror("Error", "File verification failed - corrupt download.")
             else:
                 messagebox.showerror("Error", f"Download failed: HTTP {response.status_code}")
                 
-            self.status_label.config(text="Ready") # Reset status
+            self.status_label.config(text="Ready")
         except Exception as e:
             logger.error(f"Download error: {e}", exc_info=True)
             messagebox.showerror("Download Error", f"Failed to download: {e}")
@@ -3750,23 +3683,28 @@ HALT         ; Stop execution
     def show_about(self):
         """Show about dialog"""
         try:
-            about_text = f"""MonsterApps Enhanced Client
+            about_text = f"""MonsterApps Enhanced Client - Direct Mod Access
 Version: 2024.1 Advanced
 
 🚀 Features:
-• P2P App Distribution with Web Server
+• P2P App & Mod Distribution
 • MySQL-based Node Discovery  
 • Real-time Network Chat
 • 8-bit CPU Emulator & Assembler
-• ModLoader & Expansion System with Backups
+• Direct Mod Access (Mods can modify anything!)
 • Usage Tracking & Badges
 • Encrypted Communications
+
+⚠️ MOD WARNING:
+Mods have FULL access to modify the client.
+They can break the client - this is by design.
 
 🔧 Your Node:
 • ID: {self.auth.node_id}
 • Username: {self.auth.username}
 • Web Server: Port {CONFIG['WEBSERVER_PORT']}
-• Apps Shared: {len(self.app_manager.get_apps())}
+• Applications: {len(self.app_manager.get_applications())}
+• Mods: {len(self.app_manager.get_mods())}
 
 Visit: {CONFIG['PORTAL_URL']}"""
             
@@ -3803,44 +3741,37 @@ SYSTEM:
 
 REGISTERS: A, B, C, D (8-bit each)
 MEMORY: 256 bytes (0-255)
-STACK: Grows downward from address 255
-
-Example Program:
-MOV A, 10
-MOV B, 5  
-ADD A, B
-STORE A, 100
-HALT"""
+STACK: Grows downward from address 255"""
             
             messagebox.showinfo("CPU Instruction Set", help_text)
         except Exception as e:
             logger.error(f"Show CPU help error: {e}", exc_info=True)
     
-    # Additional utility methods for more features
     def edit_app_details(self, app_id: str):
         """Edit app details dialog"""
         try:
-            messagebox.showinfo("Feature", "Edit app details dialog would open here")
+            messagebox.showinfo("Feature", "Edit details dialog would open here")
         except Exception as e:
-            logger.error(f"Edit app details error: {e}", exc_info=True)
+            logger.error(f"Edit details error: {e}", exc_info=True)
     
     def show_detailed_stats(self, app_id: str):
         """Show detailed app statistics"""
         try:
             stats = self.app_manager.get_app_stats(app_id)
             if stats:
-                stats_text = f"""App Statistics for {stats['name']}:
+                item_type = "Mod" if stats['is_mod'] else "Application"
+                stats_text = f"""{item_type} Statistics for {stats['name']}:
 
+Type: {item_type}
 Launches: {stats['launch_count']}
 Usage Time: {self._format_time(stats['total_usage_time'])}
 Downloads: {stats['downloads']}
 Rating: {stats['rating']:.1f}/5.0
 Badges: {', '.join(stats['badges']) if stats['badges'] else 'None'}
-Is Mod/Expansion: {'Yes' if stats['is_expansion'] else 'No'}
 Created: {datetime.fromtimestamp(stats['created_at']).strftime('%Y-%m-%d %H:%M')}"""
                 messagebox.showinfo(f"Stats: {stats['name']}", stats_text)
             else:
-                messagebox.showwarning("Stats Error", "Could not retrieve statistics for this app.")
+                messagebox.showwarning("Stats Error", "Could not retrieve statistics.")
         except Exception as e:
             logger.error(f"Show detailed stats error: {e}", exc_info=True)
     
@@ -3848,53 +3779,50 @@ Created: {datetime.fromtimestamp(stats['created_at']).strftime('%Y-%m-%d %H:%M')
         """Share app to network"""
         try:
             if app_id not in self.app_manager.apps:
-                messagebox.showerror("Share Error", "App not found in local registry.")
+                messagebox.showerror("Share Error", "Item not found.")
                 return
             
             app = self.app_manager.apps[app_id]
-            
-            if app.is_expansion:
-                messagebox.showwarning("Share Warning", "Mods/Expansions are typically for local client modification and not shared on the network directly. You can share regular apps.")
-                return
 
             local_ip = self._get_local_ip()
             download_url = f"http://{local_ip}:{CONFIG['WEBSERVER_PORT']}/grab?ack={app.app_token}"
             
             if self.discovery.register_app_availability(app, download_url):
-                messagebox.showinfo("Success", f"'{app.name}' is now shared on the network!")
+                item_type = "mod" if app.is_mod else "application"
+                messagebox.showinfo("Success", f"'{app.name}' ({item_type}) is now shared on the network!")
             else:
-                messagebox.showerror("Error", "Failed to share app to network. Check database connection.")
+                messagebox.showerror("Error", "Failed to share to network.")
                 
         except Exception as e:
             logger.error(f"Share app error: {e}", exc_info=True)
-            messagebox.showerror("Error", f"Failed to share app: {e}")
+            messagebox.showerror("Error", f"Failed to share: {e}")
     
     def remove_app(self, app_id: str):
         """Remove app/mod with confirmation"""
         try:
             if app_id not in self.app_manager.apps:
-                messagebox.showerror("Remove Error", "App/Mod not found in local registry.")
+                messagebox.showerror("Remove Error", "Item not found.")
                 return
             
             app = self.app_manager.apps[app_id]
             
-            item_type = "mod" if app.is_expansion else "application"
+            item_type = "mod" if app.is_mod else "application"
             result = messagebox.askyesno("Confirm Removal", 
-                                       f"Are you sure you want to remove the {item_type} '{app.name}' from your collection?\n\n"
-                                       "This will also delete the associated file from the client's managed directory.")
+                                       f"Are you sure you want to remove the {item_type} '{app.name}'?\n\n"
+                                       "This will delete the file from the managed directory.")
             
             if result:
                 if self.app_manager.remove_app(app_id):
                     messagebox.showinfo("Removed", f"'{app.name}' ({item_type}) has been removed.")
-                    if app.is_expansion:
+                    if app.is_mod:
                         self.refresh_mods()
                     else:
                         self.refresh_apps()
                 else:
                     messagebox.showerror("Error", f"Failed to remove {item_type}.")
         except Exception as e:
-            logger.error(f"Remove app/mod error: {e}", exc_info=True)
-            messagebox.showerror("Error", f"Failed to remove {item_type}: {e}")
+            logger.error(f"Remove error: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Failed to remove item: {e}")
     
     def generate_invite_link(self):
         """Generate network invite link"""
@@ -3912,8 +3840,8 @@ Created: {datetime.fromtimestamp(stats['created_at']).strftime('%Y-%m-%d %H:%M')
 Connected Nodes: {len(self.connected_nodes)}
 Database: {'Connected' if self.discovery.db.is_available() else 'Fallback Mode'}
 Web Server: Running on port {CONFIG['WEBSERVER_PORT']}
-Apps Shared: {len([app for app in self.app_manager.get_apps() if not app.is_expansion])}
-Mods/Expansions Installed: {len([app for app in self.app_manager.get_apps() if app.is_expansion])}"""
+Applications Shared: {len(self.app_manager.get_applications())}
+Mods Shared: {len(self.app_manager.get_mods())}"""
             messagebox.showinfo("Network Status", status_text)
         except Exception as e:
             logger.error(f"Show network status error: {e}", exc_info=True)
@@ -3923,9 +3851,9 @@ Mods/Expansions Installed: {len([app for app in self.app_manager.get_apps() if a
         try:
             backup_created = self.app_manager._create_client_backup()
             if backup_created:
-                messagebox.showinfo("Backup Created", "Client backup created successfully in 'client_backups' directory!")
+                messagebox.showinfo("Backup Created", "Client backup created successfully!")
             else:
-                messagebox.showerror("Error", "Failed to create backup. Check logs for details.")
+                messagebox.showerror("Error", "Failed to create backup.")
         except Exception as e:
             logger.error(f"Create backup error: {e}", exc_info=True)
             messagebox.showerror("Backup Error", f"Backup failed: {e}")
@@ -3933,9 +3861,7 @@ Mods/Expansions Installed: {len([app for app in self.app_manager.get_apps() if a
     def restore_backup(self):
         """Restore from backup"""
         try:
-            messagebox.showinfo("Feature", "Backup restore functionality would be implemented here.\n\n"
-                               "This would typically involve selecting a backup directory and overwriting "
-                               "the current client files. Requires careful handling to prevent data loss.")
+            messagebox.showinfo("Feature", "Backup restore functionality would be implemented here.")
         except Exception as e:
             logger.error(f"Restore backup error: {e}", exc_info=True)
     
@@ -3945,44 +3871,39 @@ Mods/Expansions Installed: {len([app for app in self.app_manager.get_apps() if a
             if messagebox.askyesno("Exit", "Exit MonsterApps Enhanced Client?"):
                 logger.info("Application shutting down...")
                 
-                # Stop services
                 try:
                     if hasattr(self, 'web_server') and self.web_server.server_thread and self.web_server.server_thread.is_alive():
                         self.web_server.stop()
-                        self.web_server.server_thread.join(timeout=5) # Wait for thread to finish
-                        if self.web_server.server_thread.is_alive():
-                            logger.warning("Web server thread did not terminate gracefully.")
+                        self.web_server.server_thread.join(timeout=5)
                     
                     if hasattr(self, 'discovery') and self.discovery.db:
-                        # Set node as offline in DB
                         try:
                             self.discovery.db.execute(
                                 "UPDATE mesh_nodes SET status = 'offline' WHERE node_id = %s", 
                                 (self.auth.node_id,)
                             )
                         except Exception as db_e:
-                            logger.error(f"Failed to set node offline in DB: {db_e}")
+                            logger.error(f"Failed to set node offline: {db_e}")
                         self.discovery.db.close()
                     
                     logger.info("Services stopped successfully")
                     
                 except Exception as e:
-                    logger.error(f"Error stopping services during shutdown: {e}", exc_info=True)
+                    logger.error(f"Error stopping services: {e}", exc_info=True)
                 
                 self.root.destroy()
-                sys.exit(0) # Ensure process exits
+                sys.exit(0)
                 
         except Exception as e:
             logger.error(f"Shutdown error: {e}", exc_info=True)
             self.root.destroy()
-            sys.exit(1) # Exit with error code if shutdown itself fails
+            sys.exit(1)
 
 def main():
-    """Main application entry point with comprehensive error handling"""
+    """Main application entry point"""
     try:
-        logger.info("Starting Enhanced MonsterApps Client...")
+        logger.info("Starting Enhanced MonsterApps Client with Direct Mod Access...")
         
-        # Check dependencies
         if not MYSQL_AVAILABLE:
             logger.warning("MySQL not available - limited functionality")
         
@@ -3990,17 +3911,15 @@ def main():
             logger.warning("Cryptography not available - using fallback")
         
         # Create data directories
-        # These are handled by EnhancedAppManager's __init__ now, but ensuring here for robustness
         for directory in ['monsterapps_data', 
                          os.path.join('monsterapps_data', CONFIG['APPS_DIR']), 
-                         os.path.join('monsterapps_data', CONFIG['EXPANSIONS_DIR']), 
+                         os.path.join('monsterapps_data', CONFIG['MODS_DIR']), 
                          os.path.join('monsterapps_data', CONFIG['BACKUPS_DIR']),
                          os.path.join('monsterapps_data', CONFIG['UPLOAD_PATH'])]:
             try:
                 os.makedirs(directory, exist_ok=True)
-                logger.debug(f"Ensured directory exists: {directory}")
             except Exception as e:
-                logger.error(f"Could not create directory {directory}: {e}", exc_info=True)
+                logger.error(f"Could not create directory {directory}: {e}")
         
         # Start GUI
         app = EnhancedMonsterAppsGUI()
@@ -4017,11 +3936,10 @@ def main():
                 messagebox.showerror("Unexpected Error", 
                                    f"An unexpected error occurred:\n{exc_type.__name__}: {exc_value}")
             except:
-                pass  # If GUI is already destroyed or messagebox fails
+                pass
         
         sys.excepthook = handle_exception
         
-        # Start main loop
         logger.info("Starting GUI main loop...")
         app.root.mainloop()
         
@@ -4032,7 +3950,7 @@ def main():
         try:
             messagebox.showerror("Critical Error", f"Application failed to start: {e}")
         except:
-            print(f"Critical error: {e}") # Fallback print if messagebox fails
+            print(f"Critical error: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
