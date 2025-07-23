@@ -314,6 +314,15 @@ class SimpleDatabase:
         
         for table_sql in tables:
             self.execute(table_sql)
+        
+        # Add is_mod column if it doesn't exist (for existing databases)
+        try:
+            self.execute("""
+                ALTER TABLE app_availability 
+                ADD COLUMN IF NOT EXISTS is_mod BOOLEAN DEFAULT FALSE
+            """)
+        except:
+            pass  # Column might already exist
     
     def execute(self, query: str, params: tuple = None) -> bool:
         """Execute a query (INSERT, UPDATE, DELETE) - returns success"""
@@ -405,7 +414,13 @@ class SimpleDatabase:
         elif "chat_messages" in query.lower():
             return self.fallback_data['messages']
         elif "app_availability" in query.lower():
-            return self.fallback_data['apps']
+            # Ensure fallback apps have is_mod field
+            apps = []
+            for app in self.fallback_data['apps']:
+                if 'is_mod' not in app:
+                    app['is_mod'] = False
+                apps.append(app)
+            return apps
         
         return None if fetch_one else []
     
@@ -1727,6 +1742,9 @@ class SimpleNodeDiscovery:
     def register_app_availability(self, app: AppInfo, download_url: str) -> bool:
         """Register app/mod availability for network sharing"""
         try:
+            # Log what we're registering
+            logger.info(f"Registering {app.name} - Type: {'MOD' if app.is_mod else 'APP'} (is_mod={app.is_mod})")
+            
             success = self.db.execute("""
                 INSERT INTO app_availability (node_id, app_token, app_name, app_category, 
                                             file_size, file_hash, download_url, is_mod)
@@ -1738,13 +1756,38 @@ class SimpleNodeDiscovery:
                     last_verified = CURRENT_TIMESTAMP
             """, (
                 self.auth.node_id, app.app_token, app.name, app.category,
-                app.file_size, app.file_hash, download_url, app.is_mod
+                app.file_size, app.file_hash, download_url, int(app.is_mod)
             ))
+            
+            if success:
+                logger.info(f"Successfully registered {app.name} as {'MOD' if app.is_mod else 'APP'}")
+            else:
+                logger.error(f"Failed to register {app.name}")
+                # Fallback storage
+                if self.db.fallback_mode:
+                    app_data = {
+                        'node_id': self.auth.node_id,
+                        'username': self.auth.username,
+                        'node_status': 'online',
+                        'app_token': app.app_token,
+                        'app_name': app.name,
+                        'category': app.category,
+                        'file_size': app.file_size,
+                        'file_hash': app.file_hash,
+                        'download_url': download_url,
+                        'last_verified': datetime.now(),
+                        'app_status': 'available',
+                        'is_mod': app.is_mod,
+                        'available': True
+                    }
+                    self.db.fallback_data['apps'].append(app_data)
+                    logger.info(f"Registered {app.name} as {'MOD' if app.is_mod else 'APP'} in fallback mode")
+                    return True
             
             return success
             
         except Exception as e:
-            logger.error(f"App/Mod registration error: {e}", exc_info=True)
+            logger.error(f"App/Mod registration error for {app.name}: {e}", exc_info=True)
             return False
     
     def get_available_apps(self) -> List[Dict]:
@@ -1753,12 +1796,12 @@ class SimpleNodeDiscovery:
             rows = self.db.query("""
                 SELECT aa.node_id, mn.username, mn.status, aa.app_token, aa.app_name, 
                        aa.app_category, aa.file_size, aa.file_hash, aa.download_url,
-                       aa.last_verified, aa.status as app_status, aa.is_mod
+                       aa.last_verified, aa.status as app_status, COALESCE(aa.is_mod, FALSE) as is_mod
                 FROM app_availability aa
                 JOIN mesh_nodes mn ON aa.node_id = mn.node_id
                 WHERE mn.last_heartbeat > NOW() - INTERVAL 300 SECOND
                 AND aa.status = 'available'
-                ORDER BY aa.app_name, mn.username
+                ORDER BY aa.is_mod DESC, aa.app_name, mn.username
             """)
             
             if rows is not None:
@@ -1781,7 +1824,8 @@ class SimpleNodeDiscovery:
                             'download_url': download_url,
                             'last_verified': last_verified,
                             'app_status': app_status,
-                            'is_mod': bool(is_mod),
+                            # FIX: Ensure is_mod is correctly converted to boolean
+                            'is_mod': bool(int(is_mod)) if is_mod is not None else False,
                             'available': True  # Always true for online nodes
                         })
                     except Exception as e:
@@ -2634,9 +2678,10 @@ HALT         ; Stop execution
                 if self.discovery.db.is_available():
                     self.root.after(0, lambda: self.update_service_status("db", "✅", "#4CAF50"))
                     
-                    # Register all apps and mods
+                    # Register all apps and mods with their correct type
                     for app in self.app_manager.get_apps():
                         download_url = f"http://{local_ip}:{CONFIG['WEBSERVER_PORT']}/grab?ack={app.app_token}"
+                        # Pass the full AppInfo object to preserve is_mod status
                         self.discovery.register_app_availability(app, download_url)
                         
                 else:
@@ -2841,54 +2886,63 @@ HALT         ; Stop execution
             return None
     
     def create_store_item(self, app_data, parent_frame):
-        """Create store item with availability status"""
+        """Create store item with availability status - matching app card styling"""
         try:
-            # Store item frame
-            item = tk.Frame(parent_frame, bg='#2d3748', relief='raised', bd=1)
-            item.pack(fill='x', padx=5, pady=3)
-            
-            # Header
-            header = tk.Frame(item, bg='#2d3748')
-            header.pack(fill='x', padx=10, pady=5)
-            
-            # App info
-            info_frame = tk.Frame(header, bg='#2d3748')
-            info_frame.pack(side='left', fill='x', expand=True)
-            
-            # Type and availability indicator
+            # Determine if it's a mod or app
             is_mod = app_data.get('is_mod', False)
-            type_text = "🔧 MOD" if is_mod else "📱 APP"
+            
+            # Main card frame - same as create_app_card
+            card = tk.Frame(parent_frame, bg='#2d3748', relief='raised', bd=2)
+            card.pack(fill='x', padx=5, pady=5)
+            
+            # Header with app name and type
+            header = tk.Frame(card, bg='#2d3748')
+            header.pack(fill='x', padx=10, pady=(10, 5))
+            
+            # App icon and name
+            name_frame = tk.Frame(header, bg='#2d3748')
+            name_frame.pack(side='left', fill='x', expand=True)
+            
+            # App type indicator - matching exact style from app cards
+            app_type_text = "🔧 MOD" if is_mod else "📱 APP"
             type_color = '#FF6B35' if is_mod else '#4CAF50'
             
-            tk.Label(info_frame, text=f"🟢 ONLINE {type_text}", fg=type_color, bg='#2d3748',
+            tk.Label(name_frame, text=app_type_text, fg=type_color, bg='#2d3748', 
                     font=('Arial', 8, 'bold')).pack(anchor='w')
             
-            tk.Label(info_frame, text=app_data['app_name'], fg='white', bg='#2d3748',
-                    font=('Arial', 12, 'bold')).pack(anchor='w')
+            tk.Label(name_frame, text=app_data['app_name'], fg='white', bg='#2d3748',
+                    font=('Arial', 14, 'bold')).pack(anchor='w')
             
             provider_text = f"From: {app_data['username']} | {app_data['category']}"
-            tk.Label(info_frame, text=provider_text, fg='#a0aec0', bg='#2d3748',
-                    font=('Arial', 9)).pack(anchor='w')
+            tk.Label(name_frame, text=provider_text, 
+                    fg='#a0aec0', bg='#2d3748', font=('Arial', 9)).pack(anchor='w')
             
-            # Download button
-            download_btn = tk.Button(header, text="⬇️ Download", bg=type_color, fg='white',
-                                   font=('Arial', 10, 'bold'),
-                                   command=lambda: self.download_app_from_store(app_data))
-            download_btn.pack(side='right')
+            # Download button with proper color
+            download_btn = tk.Button(header, text="⬇️ Download",
+                                  bg=type_color, fg='white', font=('Arial', 10, 'bold'),
+                                  command=lambda: self.download_app_from_store(app_data))
+            download_btn.pack(side='right', padx=(10, 0))
             
-            # Details
-            details_frame = tk.Frame(item, bg='#2d3748')
-            details_frame.pack(fill='x', padx=10, pady=(0, 5))
+            # Stats row
+            stats_frame = tk.Frame(card, bg='#2d3748')
+            stats_frame.pack(fill='x', padx=10, pady=5)
             
-            size_text = f"💾 {self._format_size(app_data['file_size'])}"
-            downloads_text = f"⬇️ {app_data.get('downloads', 0)} downloads"
+            # Network status and file info
+            stats_text = f"🟢 Online | 💾 {self._format_size(app_data['file_size'])}"
+            if app_data.get('downloads', 0) > 0:
+                stats_text += f" | ⬇️ {app_data['downloads']} downloads"
             
-            tk.Label(details_frame, text=f"{size_text} | {downloads_text}", 
-                    fg='#a0aec0', bg='#2d3748', font=('Arial', 9)).pack(side='left')
+            tk.Label(stats_frame, text=stats_text, fg='#a0aec0', bg='#2d3748',
+                    font=('Arial', 9)).pack(side='left')
             
-            last_verified = app_data.get('last_verified', 'Unknown')
-            tk.Label(details_frame, text=f"Last seen: {last_verified}", 
-                    fg='#a0aec0', bg='#2d3748', font=('Arial', 9)).pack(side='right')
+            # Description (if available, otherwise use category)
+            desc_text = f"Network shared {app_data['category'].lower()}"
+            if is_mod:
+                desc_text = "Client modification - loads directly into MonsterApps"
+            
+            desc_label = tk.Label(card, text=desc_text, fg='#e2e8f0', bg='#2d3748',
+                                font=('Arial', 9), wraplength=400, justify='left')
+            desc_label.pack(fill='x', padx=10, pady=(0, 10))
                     
         except Exception as e:
             logger.error(f"Store item creation error: {e}", exc_info=True)
@@ -3009,9 +3063,23 @@ HALT         ; Stop execution
                 tk.Label(self.store_scroll_frame, text="No applications or mods available in network\nConnect to more nodes to see content!",
                         fg='#a0aec0', bg='#1e293b', font=('Arial', 12), justify='center').pack(pady=50)
             else:
+                # Debug logging
+                logger.info(f"Displaying {len(apps)} items in store")
+                
                 # Separate apps and mods
-                mods = [app for app in apps if app.get('is_mod', False)]
-                applications = [app for app in apps if not app.get('is_mod', False)]
+                mods = []
+                applications = []
+                
+                for app in apps:
+                    is_mod = app.get('is_mod', False)
+                    logger.debug(f"Store item: {app['app_name']} - is_mod={is_mod} (type: {type(is_mod)})")
+                    
+                    if is_mod:
+                        mods.append(app)
+                    else:
+                        applications.append(app)
+                
+                logger.info(f"Found {len(mods)} mods and {len(applications)} apps")
                 
                 # Display mods section if any
                 if mods:
@@ -3038,6 +3106,13 @@ HALT         ; Stop execution
                         # Add separator between mods and apps
                         separator = tk.Frame(self.store_scroll_frame, bg='#4CAF50', height=2)
                         separator.pack(fill='x', padx=20, pady=10)
+                    
+                    # Apps section header
+                    apps_header = tk.Frame(self.store_scroll_frame, bg='#1e293b')
+                    apps_header.pack(fill='x', padx=5, pady=(10, 5))
+                    
+                    tk.Label(apps_header, text=f"📱 Available Applications",
+                            fg='#4CAF50', bg='#1e293b', font=('Arial', 16, 'bold')).pack(anchor='w')
                     
                     for category, category_apps in categorized.items():
                         # Category header
@@ -3195,9 +3270,10 @@ HALT         ; Stop execution
                                 else:
                                     self.refresh_apps()
                                 
-                                # Register with network
+                                # Register with network - pass the actual app object
                                 local_ip = self._get_local_ip()
                                 download_url = f"http://{local_ip}:{CONFIG['WEBSERVER_PORT']}/grab?ack={added_app.app_token}"
+                                # Make sure to pass the AppInfo object which has the correct is_mod value
                                 self.discovery.register_app_availability(added_app, download_url)
                             else:
                                 messagebox.showerror("Error", f"Failed to add {dialog_title.lower()}. It might already exist.")
@@ -3300,7 +3376,7 @@ HALT         ; Stop execution
                 last_seen_dt = datetime.fromtimestamp(node.last_seen)
                 now = datetime.now()
                 delta = now - last_seen_dt
-
+                
                 if delta.total_seconds() < 60:
                     last_seen_str = f"{int(delta.total_seconds())}s ago"
                 elif delta.total_seconds() < 3600:
@@ -3609,7 +3685,7 @@ HALT         ; Stop execution
         """Download app from store"""
         try:
             download_url = app_data['download_url']
-            is_mod = app_data.get('is_mod', False)
+            is_mod = app_data.get('is_mod', False) # This should now be a correct boolean
             
             self.status_label.config(text=f"Downloading: {app_data['app_name']}...")
             self.root.update_idletasks()
@@ -3623,6 +3699,7 @@ HALT         ; Stop execution
                     # Get appropriate extension
                     extension = '.py' if is_mod else '.exe'
                     filename = f"{app_data['app_name']}{extension}"
+                    # Correctly determine target directory based on is_mod
                     file_path = (self.app_manager.mods_dir if is_mod else self.app_manager.apps_dir) / filename
                     
                     with open(file_path, 'wb') as f:
@@ -3633,7 +3710,7 @@ HALT         ; Stop execution
                         app_data['app_name'], 
                         app_data['category'],
                         app_data.get('company', 'Downloaded'),
-                        is_mod=is_mod
+                        is_mod=is_mod # Pass the correct boolean value
                     )
                     
                     if added_app:
@@ -3693,7 +3770,6 @@ Version: 2024.1 Advanced
 • 8-bit CPU Emulator & Assembler
 • Direct Mod Access (Mods can modify anything!)
 • Usage Tracking & Badges
-• Encrypted Communications
 
 ⚠️ MOD WARNING:
 Mods have FULL access to modify the client.
