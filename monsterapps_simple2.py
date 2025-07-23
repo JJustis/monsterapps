@@ -2363,7 +2363,7 @@ class EnhancedMonsterAppsGUI:
             
             node_info = f"""Node ID: {self.auth.node_id}
 Username: {self.auth.username}
-Web Server: http://localhost:{CONFIG['WEBSERVER_PORT']}
+Web Server: http://192.168.1.58:{CONFIG['WEBSERVER_PORT']}
 Client Token: {self.auth.client_token[:16]}..."""
             
             tk.Label(info_frame, text=node_info, fg='#cccccc', bg='#1e293b', 
