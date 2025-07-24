@@ -1,0 +1,79 @@
+# MonsterApps Enhanced Client - Requirements
+# Core dependencies for the main client and all mods
+
+# ===========================
+# CORE CLIENT DEPENDENCIES
+# ===========================
+
+# HTTP requests and web functionality
+requests>=2.28.0
+urllib3>=1.26.0
+
+# MySQL database connectivity
+mysql-connector-python>=8.0.0
+
+# Cryptography for encryption and security
+cryptography>=3.4.0
+
+# ===========================
+# STEGANOGRAPHY MOD DEPENDENCIES
+# ===========================
+
+# Image processing and computer vision
+Pillow>=9.0.0
+numpy>=1.21.0
+opencv-python>=4.5.0
+
+# ===========================
+# SECURE BROWSER MOD DEPENDENCIES
+# ===========================
+
+# Additional parsing and web utilities
+beautifulsoup4>=4.10.0
+lxml>=4.6.0
+
+# ===========================
+# OPTIONAL DEPENDENCIES
+# ===========================
+
+# Enhanced GUI components (optional)
+tkinter-tooltip>=2.0.0
+
+# Network utilities (optional)
+netifaces>=0.11.0
+
+# JSON handling improvements (optional)
+orjson>=3.6.0
+
+# ===========================
+# DEVELOPMENT DEPENDENCIES (Optional)
+# ===========================
+
+# Code formatting and linting (for mod development)
+# black>=22.0.0
+# flake8>=4.0.0
+# pylint>=2.12.0
+
+# Testing framework (for mod testing)
+# pytest>=7.0.0
+# pytest-cov>=3.0.0
+
+# ===========================
+# PLATFORM-SPECIFIC NOTES
+# ===========================
+
+# Windows users may need:
+# pywin32>=227
+
+# Linux users may need:
+# python3-tk (install via apt: sudo apt-get install python3-tk)
+
+# macOS users may need:
+# tcl-tk (install via brew: brew install tcl-tk)
+
+# ===========================
+# MINIMUM PYTHON VERSION
+# ===========================
+
+# Requires Python 3.8 or higher
+# Some features may require Python 3.9+
