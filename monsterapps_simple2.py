@@ -77,6 +77,149 @@ try:
 except ImportError:
     CRYPTO_AVAILABLE = False
     logger.warning("Cryptography not available. Install with: pip install cryptography")
+# ===========================
+# DEBUG MONSTERAPPS PYTHON SCRIPT
+# Add this to the TOP of monsterapps_simple2.py
+# ===========================
+
+import sys
+import os
+import traceback
+import platform
+
+# Create debug log file
+debug_log = "monsterapps_debug.log"
+
+def log_debug(message):
+    """Log debug messages to file and console"""
+    try:
+        with open(debug_log, "a", encoding='utf-8') as f:
+            f.write(f"{message}\n")
+        print(message)
+    except:
+        print(message)
+
+# Initial system info
+log_debug("=" * 50)
+log_debug("MONSTERAPPS DEBUG LOG")
+log_debug("=" * 50)
+log_debug(f"Python version: {sys.version}")
+log_debug(f"Platform: {platform.platform()}")
+log_debug(f"Architecture: {platform.architecture()}")
+log_debug(f"Working directory: {os.getcwd()}")
+log_debug(f"Script path: {os.path.abspath(__file__)}")
+log_debug(f"Python executable: {sys.executable}")
+
+# Check critical directories
+required_dirs = [
+    "monsterapps_data",
+    "monsterapps_data/installed_apps", 
+    "monsterapps_data/mods",
+    "monsterapps_data/client_backups"
+]
+
+log_debug("\nDIRECTORY CHECK:")
+for dir_path in required_dirs:
+    if os.path.exists(dir_path):
+        log_debug(f"✓ {dir_path} - EXISTS")
+    else:
+        log_debug(f"✗ {dir_path} - MISSING")
+
+# Check module imports
+log_debug("\nMODULE IMPORT CHECK:")
+
+modules_to_check = [
+    ("tkinter", "GUI framework"),
+    ("mysql.connector", "Database connectivity"),
+    ("cryptography", "Encryption features"),
+    ("PIL", "Image processing"),
+    ("cv2", "Computer vision"),
+    ("numpy", "Numerical computing"),
+    ("requests", "HTTP requests"),
+    ("pathlib", "Path handling"),
+    ("threading", "Threading support"),
+    ("json", "JSON processing"),
+    ("hashlib", "Hashing"),
+    ("secrets", "Secure random"),
+    ("sqlite3", "SQLite database"),
+    ("base64", "Base64 encoding"),
+    ("datetime", "Date/time handling")
+]
+
+import_results = {}
+for module_name, description in modules_to_check:
+    try:
+        if module_name == "mysql.connector":
+            import mysql.connector
+            from mysql.connector.pooling import MySQLConnectionPool
+        elif module_name == "cryptography":
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import x25519
+        elif module_name == "PIL":
+            from PIL import Image, ImageTk, ImageEnhance
+        elif module_name == "cv2":
+            import cv2
+        else:
+            __import__(module_name)
+        
+        log_debug(f"✓ {module_name} - OK ({description})")
+        import_results[module_name] = True
+    except ImportError as e:
+        log_debug(f"✗ {module_name} - MISSING: {e}")
+        import_results[module_name] = False
+    except Exception as e:
+        log_debug(f"⚠ {module_name} - ERROR: {e}")
+        import_results[module_name] = False
+
+# Check tkinter specifically (common issue)
+log_debug("\nTKINTER DETAILED CHECK:")
+try:
+    import tkinter as tk
+    import tkinter.ttk as ttk
+    import tkinter.filedialog as filedialog
+    import tkinter.messagebox as messagebox
+    import tkinter.scrolledtext as scrolledtext
+    log_debug("✓ All tkinter modules imported successfully")
+    
+    # Test tkinter window creation
+    try:
+        root = tk.Tk()
+        root.withdraw()  # Hide the window
+        root.destroy()
+        log_debug("✓ tkinter window creation test passed")
+    except Exception as e:
+        log_debug(f"✗ tkinter window creation failed: {e}")
+        
+except Exception as e:
+    log_debug(f"✗ tkinter import failed: {e}")
+
+# Custom exception handler
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """Custom exception handler to log all errors"""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    
+    error_msg = f"UNCAUGHT EXCEPTION: {exc_type.__name__}: {exc_value}"
+    log_debug(error_msg)
+    log_debug("TRACEBACK:")
+    
+    # Log full traceback
+    tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+    for line in tb_lines:
+        log_debug(line.strip())
+    
+    # Also show message box if tkinter is available
+    try:
+        import tkinter.messagebox as mb
+        mb.showerror("MonsterApps Error", f"A critical error occurred:\n\n{exc_type.__name__}: {exc_value}\n\nCheck {debug_log} for details.")
+    except:
+        pass
+
+# Install the exception handler
+sys.excepthook = handle_exception
+
+log_debug("\nSTARTING MONSTERAPPS INITIALIZATION...")
 
 # ===========================
 # CONFIGURATION
